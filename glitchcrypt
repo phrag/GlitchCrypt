@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """GlitchCrypt: a Wayland screensaver that "encrypts" the text on your screen.
 
-Takes a snapshot of the screen with grim, finds the words with tesseract OCR,
+Takes a snapshot of the screen with grim, finds the text with tesseract OCR,
 then shows a coarse, quantised, tinted version of the snapshot, with every line
 of text replaced by cycling cipher glyphs. Every few seconds a short
 RGB-split slice glitch runs. Only the rough layout of the screen survives, and
 not even text that OCR missed can be recovered (see filtered()).
 
-Exits on any key, mouse button or real mouse movement. When run from
-swayidle (see glitchcrypt.service) it is also killed on resume.
+Settings live in ~/.config/glitchcrypt/config.ini (edit with
+glitchcrypt-settings); command-line options override them.
+
+    glitchcrypt                 run now, until a key, click or mouse move
+    glitchcrypt --idle          run swayidle: start after the configured delay
+                                (this is what glitchcrypt.service runs)
+    glitchcrypt --print-config  show the effective settings as JSON
 
 This is not a lock screen: any input closes it. Pair it with your normal
 screen locker.
@@ -16,7 +21,9 @@ screen locker.
 https://www.gnu.org/licenses/gpl-3.0.html — GPL-3.0-or-later
 """
 import argparse
+import configparser
 import io
+import json
 import os
 import random
 import shutil
@@ -26,43 +33,115 @@ import sys
 import time
 import warnings
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 # Distro pygame builds often lack AVX2; harmless at these frame rates.
 warnings.filterwarnings("ignore", message=".*avx2.*", category=RuntimeWarning)
 
 from PIL import Image, ImageChops, ImageDraw, ImageOps  # noqa: E402
-import pygame  # noqa: E402
 
-# ---- tuning -------------------------------------------------------------------
-GLYPHS = "0123456789ABCDEF#$%&@*+=<>/\\|{}[]?!~^:;"
-SCRAMBLE_RATE = 2.5     # glyph changes per word per second (on average)
-GRID_ROWS = 45          # background is reduced to this many rows of cells
-                        # (keep cells taller than a text line: ~<=60 for 1080p)...
-LEVELS = 4              # ...each quantised to this many grey levels, with noise
-GLITCH_EVERY = (5.0, 10.0)
+pygame = None           # imported lazily: --idle / --print-config don't need it
+
+# ---- settings -----------------------------------------------------------------
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "glitchcrypt", "config.ini")
+SECTION = "glitchcrypt"
+
+# key: (default, type, min, max). Out-of-range values are clamped on load.
+SETTINGS = {
+    "idle_minutes":    (3,       int,   1,   120),
+    "tint":            ("#a9c7ff", str, None, None),
+    "font":            ("monospace", str, None, None),  # family or font file
+    "fps":             (12,      int,   4,   30),
+    "scramble_rate":   (2.5,     float, 0.0, 10.0),    # glyph changes/s per line
+    "glitches":        (True,    bool,  None, None),
+    "glitch_interval": (7.5,     float, 2.0, 60.0),    # average seconds between
+    # Background grid rows. Capped at 60 so cells stay taller than a line of
+    # text on common screens: above that the background could start to leak.
+    "detail":          (45,      int,   15,  60),
+    "glyphs":          ("0123456789ABCDEF#$%&@*+=<>/\\|{}[]?!~^:;", str, None, None),
+}
+
+LEVELS = 4              # background grey levels (with dither) — not configurable
 GLITCH_TIME = 0.18
 MIN_CONF = 35           # tesseract word confidence cut-off
 
 
-def hex_rgb(s):
-    s = s.lstrip("#")
+def parse_hex(s):
+    s = s.strip().lstrip("#")
     if len(s) != 6:
-        raise argparse.ArgumentTypeError("colour must look like #a9c7ff")
+        raise ValueError("colour must look like #a9c7ff")
     return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
 
 
-def default_font():
-    """Bold monospace font file via fontconfig, or None for pygame's own."""
+def load_config(path=CONFIG_PATH):
+    """Effective settings: defaults, overridden by a valid config file."""
+    cfg = {k: v[0] for k, v in SETTINGS.items()}
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read(path, encoding="utf-8")
+    except configparser.Error as e:
+        print(f"glitchcrypt: ignoring broken {path}: {e}", file=sys.stderr)
+        return cfg
+    if not cp.has_section(SECTION):
+        return cfg
+    sec = cp[SECTION]
+    for key, (default, typ, lo, hi) in SETTINGS.items():
+        if key not in sec:
+            continue
+        try:
+            if typ is bool:
+                val = sec.getboolean(key)
+            else:
+                val = typ(sec[key])
+            if lo is not None:
+                val = min(hi, max(lo, val))
+            if key == "tint":
+                parse_hex(val)
+            if key in ("glyphs", "font") and not val.strip():
+                raise ValueError("empty")
+        except ValueError:
+            print(f"glitchcrypt: bad {key} in {path}, using default", file=sys.stderr)
+            continue
+        cfg[key] = val
+    return cfg
+
+
+def save_config(cfg, path=CONFIG_PATH):
+    """Write settings atomically (used by glitchcrypt-settings)."""
+    cp = configparser.ConfigParser(interpolation=None)
+    cp[SECTION] = {k: (("true" if v else "false") if isinstance(v, bool) else str(v))
+                   for k, v in cfg.items() if k in SETTINGS}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("# GlitchCrypt settings (glitchcrypt-settings edits this file)\n")
+        cp.write(f)
+    os.replace(tmp, path)
+
+
+def resolve_font(spec):
+    """Font file for a family name (bold via fontconfig), or a path as-is."""
+    if os.path.isfile(spec):
+        return spec
     if shutil.which("fc-match"):
-        out = subprocess.run(["fc-match", "-f", "%{file}", "monospace:bold"],
+        out = subprocess.run(["fc-match", "-f", "%{file}", f"{spec}:bold"],
                              capture_output=True, text=True).stdout.strip()
         if out and os.path.exists(out):
             return out
-    return None
+    return None                                  # pygame's built-in font
 
 
+def screen_capture_works():
+    """True if grim can capture here (wlroots/niri yes; GNOME/KDE no)."""
+    if not shutil.which("grim"):
+        return False
+    return subprocess.run(["grim", "-g", "0,0 1x1", "-"], capture_output=True).returncode == 0
+
+
+# ---- capture + OCR --------------------------------------------------------------
 def snapshot():
     """Screen grab via grim (PPM: fast, and works with JPEG-less grim builds)."""
     if not shutil.which("grim"):
@@ -105,11 +184,12 @@ def ocr_boxes(img):
     return [(x0, y0, x1 - x0, y1 - y0) for x0, y0, x1, y1 in lines.values()]
 
 
-def cell_size(height):
-    return max(8, height // GRID_ROWS)
+# ---- image processing -------------------------------------------------------------
+def cell_size(height, rows):
+    return max(8, height // rows)
 
 
-def filtered(img, tint):
+def filtered(img, tint, rows):
     """Background that keeps only the coarse layout of the screen.
 
     A blur is NOT enough: blurring is largely reversible (deconvolution) and
@@ -121,7 +201,7 @@ def filtered(img, tint):
     smoothed back up for display, adding nothing new.
     """
     w, h = img.size
-    cell = cell_size(h)
+    cell = cell_size(h, rows)
     grid = ImageOps.grayscale(img).resize((max(1, w // cell), max(1, h // cell)),
                                           Image.BOX)
     step = 255 / (LEVELS - 1)
@@ -148,39 +228,49 @@ def to_surface(img):
     return pygame.image.frombytes(img.tobytes(), img.size, "RGB").convert()
 
 
-class Word:
-    def __init__(self, rect, bg):
+class Line:
+    def __init__(self, rect, bg, glyphs):
         self.rect = rect
         # Glyph count comes from the (grid-snapped) box, never from the text.
         self.n = max(1, round(rect.w / (rect.h * 0.6)))
-        self.chars = [random.choice(GLYPHS) for _ in range(self.n)]
+        self.chars = [random.choice(glyphs) for _ in range(self.n)]
         self.bg = bg
 
 
-def parse_args():
+# ---- CLI --------------------------------------------------------------------------
+def parse_args(cfg):
     ap = argparse.ArgumentParser(
         prog="glitchcrypt",
-        description="Screensaver that scrambles the text on your screen into cipher glyphs.")
-    ap.add_argument("--tint", type=hex_rgb, default=hex_rgb("#a9c7ff"),
-                    help="accent colour for the tint and glyphs (default #a9c7ff)")
-    ap.add_argument("--font", default=None,
-                    help="TTF/OTF file for the glyphs (default: fontconfig monospace:bold)")
-    ap.add_argument("--fps", type=int, default=12, help="frame rate (default 12)")
+        description="Screensaver that scrambles the text on your screen into cipher "
+                    f"glyphs. Settings: {CONFIG_PATH} (or glitchcrypt-settings).")
+    ap.add_argument("--tint", default=cfg["tint"], help="colour, e.g. #a9c7ff")
+    ap.add_argument("--font", default=cfg["font"], help="font family or file")
+    ap.add_argument("--fps", type=int, default=cfg["fps"], help="frame rate")
     ap.add_argument("--image", help="use this image instead of a screen snapshot")
     ap.add_argument("--seconds", type=float, default=0,
                     help="quit after N seconds (default: run until input)")
     ap.add_argument("--output", metavar="PNG",
                     help="render offscreen and save the last frame (for demos); "
-                         "waits for OCR, then runs --seconds (default 5)")
+                         "runs --seconds (default 5)")
+    ap.add_argument("--idle", action="store_true",
+                    help="run swayidle with the configured delay (for the service)")
+    ap.add_argument("--print-config", action="store_true",
+                    help="print the effective settings as JSON and exit")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    return ap.parse_args()
+    args = ap.parse_args()
+    try:
+        args.tint = parse_hex(args.tint)
+    except ValueError as e:
+        ap.error(str(e))
+    args.fps = min(30, max(4, args.fps))
+    return args
 
 
 def harden_process(name):
     """Rename the process and keep the screen snapshot inside it.
 
     - PR_SET_NAME: run via `env python3` the process is named python3; rename
-      it so `pkill -x glitchcrypt` (used by glitchcrypt.service) finds it.
+      it so `pkill -x glitchcrypt` (used by the idle service) finds it.
     - PR_SET_DUMPABLE 0: no core dumps, and other unprivileged processes
       can't ptrace it or read /proc/<pid>/mem, where the snapshot lives.
     - RLIMIT_CORE 0: belt and braces against core dumps.
@@ -199,21 +289,44 @@ def harden_process(name):
         pass
 
 
+def run_idle(cfg):
+    """exec swayidle: start GlitchCrypt after the configured idle time."""
+    if not screen_capture_works():
+        # e.g. GNOME/KDE: exit 0 so the service doesn't restart in a loop
+        print("glitchcrypt: this session doesn't allow screen capture with grim; "
+              "idle trigger not started", file=sys.stderr)
+        sys.exit(0)
+    if not shutil.which("swayidle"):
+        sys.exit("glitchcrypt: swayidle not found")
+    import shlex
+    me = shlex.quote(os.path.abspath(sys.argv[0]))   # swayidle runs via sh -c
+    stop = "pkill -x glitchcrypt"
+    os.execvp("swayidle", ["swayidle", "-w",
+                           "timeout", str(cfg["idle_minutes"] * 60), me,
+                           "resume", stop, "before-sleep", stop])
+
+
 def main():
+    cfg = load_config()
+    args = parse_args(cfg)
+    if args.print_config:
+        print(json.dumps(cfg, indent=2))
+        return
+    if args.idle:
+        run_idle(cfg)                    # does not return
     harden_process("glitchcrypt")
-    args = parse_args()
     # swayidle's resume does `pkill`: exit cleanly (and quietly)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    font_path = args.font or default_font()
 
     snap = Image.open(args.image).convert("RGB") if args.image else snapshot()
     # OCR *before* the window opens, so its very first frame is already fully
     # encrypted: no fade, no sweep. Until then the desktop simply stays as is.
     boxes = ocr_boxes(snap)
-    run(args, snap, boxes, args.tint, font_path)
+    run(args, cfg, snap, boxes, resolve_font(args.font))
 
 
-def run(args, snap, boxes, tint, font_path):
+def run(args, cfg, snap, boxes, font_path):
+    global pygame
     offscreen = bool(args.output)
     if offscreen:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
@@ -221,7 +334,10 @@ def run(args, snap, boxes, tint, font_path):
             args.seconds = 5
     else:
         os.environ.setdefault("SDL_VIDEODRIVER", "wayland,x11")
+    import pygame as _pygame
+    pygame = _pygame
 
+    tint, glyphs = args.tint, cfg["glyphs"]
     pygame.init()
     pygame.display.set_caption("GlitchCrypt")
     if offscreen:
@@ -233,7 +349,7 @@ def run(args, snap, boxes, tint, font_path):
     sx, sy = W / snap.width, H / snap.height
 
     # Only the coarse, quantised background ever reaches the screen.
-    filt_img = filtered(snap.resize((W, H), Image.LANCZOS), tint)
+    filt_img = filtered(snap.resize((W, H), Image.LANCZOS), tint, cfg["detail"])
     filt = to_surface(filt_img)
     split = to_surface(rgb_split(filt_img, max(3, W // 300)))
     del filt_img
@@ -248,25 +364,27 @@ def run(args, snap, boxes, tint, font_path):
             glyph_cache[key] = fonts[size].render(ch, True, tint)
         return glyph_cache[key]
 
-    words = []
-    cell = cell_size(H)
+    lines = []
+    cell = cell_size(H, cfg["detail"])
     for (x, y, w, h) in boxes:
         # widen each line to whole grid cells: line lengths are only
-        # known to within a cell (~4-5 characters)
+        # known to within a cell (several characters)
         x0 = int(x * sx) // cell * cell
         x1 = -(-int((x + w) * sx) // cell) * cell
         r = pygame.Rect(x0, int(y * sy) - 1, x1 - x0,
                         int(h * sy) + 3).clip(screen.get_rect())
         if r.w >= 3 and r.h >= 3:
-            words.append(Word(r, filt.get_at((max(0, r.x - 2), r.centery))[:3]))
+            lines.append(Line(r, filt.get_at((max(0, r.x - 2), r.centery))[:3], glyphs))
     del boxes
 
+    every = cfg["glitch_interval"]
     t0 = time.monotonic()
-    next_glitch = t0 + random.uniform(*GLITCH_EVERY)
+    next_glitch = t0 + random.uniform(every * 0.6, every * 1.4)
     glitch_bands, glitch_until = [], 0.0
     clock = pygame.time.Clock()
     grace_until = t0 + 2.0
     dt = 1.0 / args.fps
+    rate = cfg["scramble_rate"]
 
     while True:
         now = time.monotonic()
@@ -281,15 +399,15 @@ def run(args, snap, boxes, tint, font_path):
 
         screen.blit(filt, (0, 0))
 
-        for wd in words:
-            for i in range(wd.n):
-                if random.random() < SCRAMBLE_RATE * dt / wd.n * 2:
-                    wd.chars[i] = random.choice(GLYPHS)
-            r = wd.rect
-            screen.fill(wd.bg, r)
+        for ln in lines:
+            for i in range(ln.n):
+                if random.random() < rate * dt / ln.n * 2:
+                    ln.chars[i] = random.choice(glyphs)
+            r = ln.rect
+            screen.fill(ln.bg, r)
             size = max(6, int(r.h * 0.85))
-            cw = r.w / wd.n
-            for i, ch in enumerate(wd.chars):
+            cw = r.w / ln.n
+            for i, ch in enumerate(ln.chars):
                 g = glyph(ch, size)
                 gx = r.x + int(i * cw + (cw - g.get_width()) / 2)
                 gy = r.y + (r.h - g.get_height()) // 2
@@ -299,9 +417,9 @@ def run(args, snap, boxes, tint, font_path):
                 screen.blit(g, (gx, gy))
 
         # occasional short slice glitch
-        if now >= next_glitch:
+        if cfg["glitches"] and now >= next_glitch:
             glitch_until = now + GLITCH_TIME
-            next_glitch = now + random.uniform(*GLITCH_EVERY)
+            next_glitch = now + random.uniform(every * 0.6, every * 1.4)
             glitch_bands = []
             for _ in range(random.randint(2, 4)):
                 bh = random.randint(H // 60, H // 14)
@@ -328,4 +446,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
-        pygame.quit()
+        if pygame is not None:
+            pygame.quit()

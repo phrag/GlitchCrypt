@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""GlitchCrypt Settings: a GTK 4 / libadwaita app to configure GlitchCrypt.
+
+Edits ~/.config/glitchcrypt/config.ini (shared code with the glitchcrypt
+script next to this file) and turns glitchcrypt.service on or off.
+Changes save automatically; the screensaver reads them on its next start.
+
+GPL-3.0-or-later
+"""
+import importlib.machinery
+import importlib.util
+import os
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
+
+APP_ID = "app.glitchcrypt.Settings"
+SERVICE = "glitchcrypt.service"
+CORE_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "glitchcrypt")
+
+
+def load_core():
+    """Import the glitchcrypt script as a module (for its config code)."""
+    loader = importlib.machinery.SourceFileLoader("glitchcrypt_core", CORE_PATH)
+    spec = importlib.util.spec_from_loader("glitchcrypt_core", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+core = load_core()
+
+
+def systemctl(*args):
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+
+
+def rgba_to_hex(rgba):
+    return "#%02x%02x%02x" % tuple(round(c * 255) for c in (rgba.red, rgba.green, rgba.blue))
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="GlitchCrypt",
+                         default_width=580, default_height=820)
+        self.cfg = core.load_config()
+        self.loading = True
+        self.save_id = 0
+        self.idle_changed = False
+        self.updaters = []               # (key, fn(value)) to refresh widgets
+
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        preview = Gtk.Button(label="Preview")
+        preview.add_css_class("suggested-action")
+        preview.set_tooltip_text("Run GlitchCrypt for 10 seconds")
+        preview.connect("clicked", self.on_preview)
+        header.pack_start(preview)
+        reset = Gtk.Button(icon_name="edit-undo-symbolic", tooltip_text="Reset to defaults")
+        reset.connect("clicked", self.on_reset)
+        header.pack_end(reset)
+        view.add_top_bar(header)
+
+        banner = Adw.Banner(title="This session doesn't allow screen capture, so "
+                                  "GlitchCrypt can't run here (it needs Niri, Sway, "
+                                  "Hyprland or similar)")
+        banner.set_revealed(not core.screen_capture_works())
+        view.add_top_bar(banner)
+
+        self.toasts = Adw.ToastOverlay()
+        page = Adw.PreferencesPage()
+        self.toasts.set_child(page)
+        view.set_content(self.toasts)
+        self.set_content(view)
+
+        # --- Screensaver ---------------------------------------------------
+        g = Adw.PreferencesGroup(title="Screensaver")
+        page.add(g)
+        self.enable_row = Adw.SwitchRow(title="Start when idle",
+                                        subtitle="Run GlitchCrypt automatically")
+        state = systemctl("is-enabled", SERVICE).stdout.strip()
+        if state in ("", "not-found"):
+            self.enable_row.set_sensitive(False)
+            self.enable_row.set_subtitle("glitchcrypt.service isn't installed: run install.sh")
+        self.enable_row.set_active(state == "enabled")
+        self.enable_row.connect("notify::active", self.on_enable)
+        g.add(self.enable_row)
+        g.add(self.spin("idle_minutes", "Start after", "Minutes of inactivity",
+                        1, 120, 1, 0))
+
+        # --- Appearance -------------------------------------------------------
+        g = Adw.PreferencesGroup(title="Appearance")
+        page.add(g)
+
+        row = Adw.ActionRow(title="Colour", subtitle="Tint and cipher characters")
+        color = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False),
+                                      valign=Gtk.Align.CENTER)
+
+        def set_color(v):
+            rgba = Gdk.RGBA()
+            rgba.parse(v)
+            color.set_rgba(rgba)
+        set_color(self.cfg["tint"])
+        color.connect("notify::rgba", lambda b, _: self.set("tint", rgba_to_hex(b.get_rgba())))
+        self.updaters.append(("tint", set_color))
+        row.add_suffix(color)
+        row.set_activatable_widget(color)
+        g.add(row)
+
+        row = Adw.ActionRow(title="Font", subtitle="Cipher characters are drawn in bold")
+        font = Gtk.FontDialogButton(dialog=Gtk.FontDialog(), level=Gtk.FontLevel.FAMILY,
+                                    use_font=True, valign=Gtk.Align.CENTER)
+
+        def set_font(v):
+            if not os.path.isfile(v):
+                font.set_font_desc(Pango.FontDescription.from_string(v))
+        set_font(self.cfg["font"])
+        font.connect("notify::font-desc",
+                     lambda b, _: b.get_font_desc() and b.get_font_desc().get_family()
+                     and self.set("font", b.get_font_desc().get_family()))
+        self.updaters.append(("font", set_font))
+        row.add_suffix(font)
+        row.set_activatable_widget(font)
+        g.add(row)
+
+        g.add(self.spin("detail", "Background detail",
+                        "Higher shows more of your windows. Capped at 60 so text "
+                        "can never be recovered", 15, 60, 1, 0))
+
+        glyphs = Adw.EntryRow(title="Cipher characters", show_apply_button=True)
+        glyphs.set_text(self.cfg["glyphs"])
+
+        def apply_glyphs(row):
+            text = row.get_text().strip()
+            if text:
+                self.set("glyphs", text)
+            else:
+                row.set_text(self.cfg["glyphs"])
+        glyphs.connect("apply", apply_glyphs)
+        self.updaters.append(("glyphs", glyphs.set_text))
+        g.add(glyphs)
+
+        # --- Motion -------------------------------------------------------------
+        g = Adw.PreferencesGroup(title="Motion")
+        page.add(g)
+        g.add(self.spin("scramble_rate", "Scramble speed",
+                        "Character changes per second, per line", 0, 10, 0.5, 1))
+        g.add(self.spin("fps", "Frame rate", "Frames per second", 4, 30, 1, 0))
+        glitch = Adw.SwitchRow(title="Glitch effect",
+                               subtitle="Short colour-split tears across the screen")
+        glitch.set_active(self.cfg["glitches"])
+        glitch.connect("notify::active", lambda r, _: self.set("glitches", r.get_active()))
+        self.updaters.append(("glitches", glitch.set_active))
+        g.add(glitch)
+        every = self.spin("glitch_interval", "Glitch every",
+                          "Average seconds between glitches", 2, 60, 0.5, 1)
+        glitch.bind_property("active", every, "sensitive",
+                             GObject.BindingFlags.SYNC_CREATE)
+        g.add(every)
+
+        # --- Privacy note -------------------------------------------------------
+        g = Adw.PreferencesGroup(
+            title="Privacy",
+            description="GlitchCrypt never writes your screen to disk, keeps none of "
+                        "the text it recognises, and only shows a coarse, noisy "
+                        "version of the background. It is not a lock screen: any "
+                        "key, click or mouse move closes it.")
+        page.add(g)
+
+        self.connect("close-request", lambda *_: self.flush() or False)
+        self.loading = False
+
+    # --- helpers ---------------------------------------------------------------
+    def spin(self, key, title, subtitle, lo, hi, step, digits):
+        adj = Gtk.Adjustment(lower=lo, upper=hi, step_increment=step,
+                             page_increment=step * 5)
+        row = Adw.SpinRow(title=title, subtitle=subtitle, adjustment=adj, digits=digits)
+        row.set_value(self.cfg[key])
+        typ = core.SETTINGS[key][1]
+        row.connect("notify::value", lambda r, _: self.set(key, typ(r.get_value())))
+        self.updaters.append((key, row.set_value))
+        return row
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
+
+    def set(self, key, value):
+        if self.loading or self.cfg.get(key) == value:
+            return
+        self.cfg[key] = value
+        if key == "idle_minutes":
+            self.idle_changed = True
+        if self.save_id:
+            GLib.source_remove(self.save_id)
+        self.save_id = GLib.timeout_add(400, self.flush)
+
+    def flush(self):
+        if self.save_id:
+            GLib.source_remove(self.save_id)
+            self.save_id = 0
+        try:
+            core.save_config(self.cfg)
+        except OSError as e:
+            self.toast(f"Couldn't save settings: {e.strerror}")
+            return False
+        if self.idle_changed and systemctl("is-active", SERVICE).stdout.strip() == "active":
+            systemctl("restart", SERVICE)       # pick up the new delay
+        self.idle_changed = False
+        return False
+
+    # --- actions -----------------------------------------------------------------
+    def on_enable(self, row, _):
+        if self.loading:
+            return
+        on = row.get_active()
+        res = systemctl("enable" if on else "disable", "--now", SERVICE)
+        if res.returncode != 0:
+            self.loading = True
+            row.set_active(not on)
+            self.loading = False
+            self.toast("Couldn't change the service: " + (res.stderr.strip() or "error"))
+        else:
+            self.toast("GlitchCrypt will start when idle" if on else "Turned off")
+
+    def on_preview(self, _btn):
+        self.flush()
+        try:
+            Gio.Subprocess.new([CORE_PATH, "--seconds", "10"], Gio.SubprocessFlags.NONE)
+        except GLib.Error as e:
+            self.toast(f"Couldn't start preview: {e.message}")
+
+    def on_reset(self, _btn):
+        dialog = Adw.AlertDialog(heading="Reset all settings?",
+                                 body="Colours, font, motion and the idle delay go "
+                                      "back to their defaults.")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("reset", "Reset")
+        dialog.set_response_appearance("reset", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.connect("response", self.on_reset_response)
+        dialog.present(self)
+
+    def on_reset_response(self, _dialog, response):
+        if response != "reset":
+            return
+        defaults = {k: v[0] for k, v in core.SETTINGS.items()}
+        self.idle_changed = defaults["idle_minutes"] != self.cfg["idle_minutes"]
+        self.cfg = defaults
+        self.loading = True
+        for key, update in self.updaters:
+            update(self.cfg[key])
+        self.loading = False
+        self.flush()
+        self.toast("Settings reset")
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_activate(self):
+        win = self.get_active_window() or Window(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

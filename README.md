@@ -48,42 +48,59 @@ git clone <this repo> && cd GlitchCrypt
 ./install.sh --enable
 ```
 
-This installs `~/.local/bin/glitchcrypt` and a systemd user service,
-`glitchcrypt.service`. The service runs `swayidle` to start GlitchCrypt after
-**3 minutes** idle and stops it as soon as you're back. To change the delay,
-edit `timeout 180` in `~/.config/systemd/user/glitchcrypt.service`. Keep it
-shorter than your lock or screen-off timeout. Then run
-`systemctl --user daemon-reload && systemctl --user restart glitchcrypt`.
+This installs:
+
+- `glitchcrypt`, the screensaver, in `~/.local/bin`
+- `glitchcrypt-settings`, a GTK 4 / libadwaita settings app, listed as
+  **GlitchCrypt** in your app launcher
+- `glitchcrypt.service`, a systemd user service that starts GlitchCrypt when
+  you're idle (3 minutes by default) and stops it as soon as you're back
 
 The service is `WantedBy=graphical-session.target`, which niri, Sway (via
-`sway-systemd` or uwsm) and Hyprland (via uwsm) all start. If your session
-doesn't, start it from your compositor's autostart instead.
+`sway-systemd` or uwsm) and Hyprland (via uwsm) all start. In sessions where
+`grim` can't capture the screen, such as GNOME or KDE, it exits quietly.
 
-Uninstall with `./install.sh --uninstall`.
+Uninstall with `./install.sh --uninstall`. Your settings in
+`~/.config/glitchcrypt/` are kept.
 
-## Usage
+## Settings
+
+Open **GlitchCrypt** from your app launcher to change:
+
+| Setting | Default | |
+|---|---|---|
+| Start when idle | on | Turns the idle service on or off |
+| Start after | 3 min | Keep it shorter than your lock / screen-off timeout |
+| Colour | `#a9c7ff` | Tint and cipher characters |
+| Font | monospace | Drawn in bold |
+| Background detail | 45 | Grid rows. Capped at 60 so text can't be recovered |
+| Cipher characters | `0-9 A-F` + symbols | The alphabet the glyphs are drawn from |
+| Scramble speed | 2.5 | Character changes per second, per line |
+| Frame rate | 12 | |
+| Glitch effect | on, every ~7.5 s | |
+
+Changes save automatically to `~/.config/glitchcrypt/config.ini` and apply the
+next time GlitchCrypt starts. **Preview** runs it for 10 seconds. You can also
+edit the file by hand. Invalid or out-of-range values fall back to defaults or
+are clamped, and `glitchcrypt --print-config` shows what's in effect.
+
+## Command line
 
 ```sh
 glitchcrypt                    # run now, until a key, click or mouse move
 glitchcrypt --seconds 15       # preview for 15 s
-glitchcrypt --tint '#ff6ac1'   # pink instead of the default blue
+glitchcrypt --tint '#ff6ac1'   # override the colour for this run
 glitchcrypt --image shot.png --output out.png   # render offscreen to a PNG
 ```
 
-| Option | Default | |
-|---|---|---|
-| `--tint HEX` | `#a9c7ff` | Colour of the tint and the glyphs |
-| `--font FILE` | fontconfig `monospace:bold` | Font for the glyphs |
-| `--fps N` | `12` | Frame rate |
-| `--image FILE` | screen snapshot | Use an image instead of the screen |
-| `--seconds N` | until input | Quit after N seconds |
-| `--output PNG` | | Render offscreen and save the last frame |
-
-To change the behaviour, edit the constants at the top of `glitchcrypt`:
-`SCRAMBLE_RATE` (how fast glyphs change), `GRID_ROWS` / `LEVELS` (background
-coarseness; raising them reveals more of your screen),
-`GLITCH_EVERY` (the slice glitch interval), `GLYPHS` (the cipher alphabet) and
-others.
+| Option | |
+|---|---|
+| `--tint HEX`, `--font NAME`, `--fps N` | Override the saved setting for this run |
+| `--image FILE` | Use an image instead of the screen |
+| `--seconds N` | Quit after N seconds |
+| `--output PNG` | Render offscreen and save the last frame |
+| `--idle` | Run swayidle with the configured delay (what the service runs) |
+| `--print-config` | Show the effective settings as JSON |
 
 ## Privacy
 

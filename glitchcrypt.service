@@ -1,14 +1,13 @@
 [Unit]
-Description=GlitchCrypt screensaver (starts after 3 min idle)
+Description=GlitchCrypt screensaver idle trigger
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
-# Change 180 to taste. Keep it below your lock/screen-off timeout.
-ExecStart=/usr/bin/swayidle -w \
-    timeout 180 '%h/.local/bin/glitchcrypt' \
-    resume 'pkill -x glitchcrypt' \
-    before-sleep 'pkill -x glitchcrypt'
+# Reads the idle delay from ~/.config/glitchcrypt/config.ini and runs swayidle.
+# glitchcrypt-settings restarts this service when the delay changes.
+# In sessions where grim can't capture (GNOME, KDE) it exits quietly.
+ExecStart=%h/.local/bin/glitchcrypt --idle
 ExecStopPost=-/usr/bin/pkill -x glitchcrypt
 Restart=on-failure
 

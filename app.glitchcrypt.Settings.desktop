@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=GlitchCrypt
+GenericName=Screensaver Settings
+Comment=Configure the GlitchCrypt screensaver
+Exec=@BINDIR@/glitchcrypt-settings
+Icon=preferences-desktop-screensaver
+Terminal=false
+Categories=Settings;DesktopSettings;GTK;
+Keywords=screensaver;idle;glitch;privacy;
+StartupNotify=true
