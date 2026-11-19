@@ -2,15 +2,16 @@
 """GlitchCrypt: a Wayland screensaver that "encrypts" the text on your screen.
 
 Takes a snapshot of the screen with grim, finds the words with tesseract OCR,
-then shows the snapshot darkened and tinted, with every word replaced by
-cycling cipher glyphs. Now and then a word briefly decrypts, and every few
-seconds a short RGB-split slice glitch runs.
+then shows a coarse, quantised, tinted version of the snapshot, with every line
+of text replaced by cycling cipher glyphs. Every few seconds a short
+RGB-split slice glitch runs. Only the rough layout of the screen survives, and
+not even text that OCR missed can be recovered (see filtered()).
 
 Exits on any key, mouse button or real mouse movement. When run from
 swayidle (see glitchcrypt.service) it is also killed on resume.
 
-This is eye candy, not a lock screen: the real text is still in memory and
-words decrypt on purpose. Pair it with your normal screen locker.
+This is not a lock screen: any input closes it. Pair it with your normal
+screen locker.
 
 https://www.gnu.org/licenses/gpl-3.0.html — GPL-3.0-or-later
 """
@@ -22,8 +23,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
-import threading
 import time
 import warnings
 
@@ -39,12 +38,10 @@ import pygame  # noqa: E402
 # ---- tuning -------------------------------------------------------------------
 GLYPHS = "0123456789ABCDEF#$%&@*+=<>/\\|{}[]?!~^:;"
 SCRAMBLE_RATE = 2.5     # glyph changes per word per second (on average)
-REVEAL_CHANCE = 0.012   # per word per second: briefly show the real word
-REVEAL_TIME = 1.6       # seconds a revealed word stays readable
+GRID_ROWS = 28          # background is reduced to this many rows of cells...
+LEVELS = 4              # ...each quantised to this many grey levels, with noise
 GLITCH_EVERY = (5.0, 10.0)
 GLITCH_TIME = 0.18
-FADE_IN = 1.5
-WAVE_TIME = 2.0         # top-to-bottom encryption sweep
 MIN_CONF = 35           # tesseract word confidence cut-off
 
 
@@ -74,34 +71,66 @@ def snapshot():
     return Image.open(io.BytesIO(raw)).convert("RGB")
 
 
-def ocr_words(path):
-    """Word boxes from tesseract TSV, in snapshot pixel coordinates."""
+def ocr_boxes(img):
+    """Text-line boxes (x, y, w, h) from tesseract, in snapshot pixels.
+
+    The image goes to tesseract over a pipe, so no copy of the screen ever
+    touches a disk. Only boxes are kept (the recognised text is dropped), and
+    words are merged into whole lines so word lengths don't show.
+    """
     if not shutil.which("tesseract"):
         print("glitchcrypt: tesseract not found, nothing to encrypt", file=sys.stderr)
         return []
-    out = subprocess.run(["tesseract", path, "-", "--psm", "11", "tsv"],
-                         capture_output=True, text=True).stdout
-    words = []
-    for line in out.splitlines()[1:]:
-        f = line.split("\t")
+    buf = io.BytesIO()
+    ImageOps.grayscale(img).save(buf, "PPM")        # PGM: fast, lossless
+    out = subprocess.run(["tesseract", "stdin", "stdout", "--psm", "11", "tsv"],
+                         input=buf.getvalue(), capture_output=True).stdout
+    del buf
+    lines = {}
+    for row in out.decode(errors="replace").splitlines()[1:]:
+        f = row.split("\t")
         if len(f) < 12 or f[0] != "5":
             continue
-        text = f[11].strip()
         try:
             x, y, w, h, conf = int(f[6]), int(f[7]), int(f[8]), int(f[9]), float(f[10])
         except ValueError:
             continue
-        if conf < MIN_CONF or not any(c.isalnum() for c in text) or not 6 <= h <= 160:
+        if conf < MIN_CONF or not any(c.isalnum() for c in f[11]) or not 6 <= h <= 160:
             continue
-        words.append((x, y, w, h, text))
-    return words
+        key = tuple(f[1:5])                          # page, block, par, line
+        x0, y0, x1, y1 = lines.get(key, (x, y, x + w, y + h))
+        lines[key] = (min(x0, x), min(y0, y), max(x1, x + w), max(y1, y + h))
+    del out
+    return [(x0, y0, x1 - x0, y1 - y0) for x0, y0, x1, y1 in lines.values()]
+
+
+def cell_size(height):
+    return max(8, height // GRID_ROWS)
 
 
 def filtered(img, tint):
-    """Darkened, tinted, scanlined copy of the snapshot."""
+    """Background that keeps only the coarse layout of the screen.
+
+    A blur is NOT enough: blurring is largely reversible (deconvolution) and
+    blurred text can be matched by rendering + blurring guesses. Instead the
+    screen is averaged down to a grid of cells ~2 text lines tall, and each
+    cell is quantised to LEVELS grey levels with random dither. Quantisation
+    discards information for good; what's left is ~2 bits per cell, enough to
+    say "something bright/dark is here" and no more. That grid is then
+    smoothed back up for display, adding nothing new.
+    """
+    w, h = img.size
+    cell = cell_size(h)
+    grid = ImageOps.grayscale(img).resize((max(1, w // cell), max(1, h // cell)),
+                                          Image.BOX)
+    step = 255 / (LEVELS - 1)
+    grid = Image.frombytes("L", grid.size, bytes(
+        int(min(LEVELS - 1, max(0, round(v / step + random.uniform(-0.5, 0.5)))) * step)
+        for v in grid.tobytes()))
+    soft = grid.resize((w, h), Image.BILINEAR)
     dark = tuple(max(2, int(c * 0.03)) for c in tint)
     light = tuple(int(c * 0.38) for c in tint)
-    out = ImageOps.colorize(ImageOps.grayscale(img), dark, light).convert("RGB")
+    out = ImageOps.colorize(soft, dark, light).convert("RGB")
     d = ImageDraw.Draw(out, "RGBA")
     for y in range(0, out.height, 3):
         d.line([(0, y), (out.width, y)], fill=(0, 0, 0, 70))
@@ -119,12 +148,11 @@ def to_surface(img):
 
 
 class Word:
-    def __init__(self, rect, text, start, bg):
+    def __init__(self, rect, bg):
         self.rect = rect
-        self.n = max(1, len(text))
+        # Glyph count comes from the (grid-snapped) box, never from the text.
+        self.n = max(1, round(rect.w / (rect.h * 0.6)))
         self.chars = [random.choice(GLYPHS) for _ in range(self.n)]
-        self.start = start          # when it becomes encrypted
-        self.reveal_until = 0.0
         self.bg = bg
 
 
@@ -147,47 +175,47 @@ def parse_args():
     return ap.parse_args()
 
 
-def set_process_name(name):
-    """Run via `env python3`, the process is named python3; rename it so
-    `pkill -x glitchcrypt` (used by glitchcrypt.service) can find it."""
+def harden_process(name):
+    """Rename the process and keep the screen snapshot inside it.
+
+    - PR_SET_NAME: run via `env python3` the process is named python3; rename
+      it so `pkill -x glitchcrypt` (used by glitchcrypt.service) finds it.
+    - PR_SET_DUMPABLE 0: no core dumps, and other unprivileged processes
+      can't ptrace it or read /proc/<pid>/mem, where the snapshot lives.
+    - RLIMIT_CORE 0: belt and braces against core dumps.
+    """
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ImportError, ValueError, OSError):
+        pass
     try:
         import ctypes
         libc = ctypes.CDLL(None, use_errno=True)
         libc.prctl(15, name.encode(), 0, 0, 0)          # PR_SET_NAME
+        libc.prctl(4, 0, 0, 0, 0)                       # PR_SET_DUMPABLE = 0
     except (OSError, AttributeError):
         pass
 
 
 def main():
-    set_process_name("glitchcrypt")
+    harden_process("glitchcrypt")
     args = parse_args()
-    # swayidle's resume does `pkill`: exit cleanly so the snapshot gets deleted
+    # swayidle's resume does `pkill`: exit cleanly (and quietly)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    tint = args.tint
-    tint_hot = tuple(int(c + (255 - c) * 0.6) for c in tint)
     font_path = args.font or default_font()
 
     snap = Image.open(args.image).convert("RGB") if args.image else snapshot()
-    # tesseract wants a file; keep it in the user-only runtime dir and delete it.
-    fd, snap_path = tempfile.mkstemp(prefix="glitchcrypt-", suffix=".png",
-                                     dir=os.environ.get("XDG_RUNTIME_DIR"))
-    os.close(fd)
-    try:
-        snap.save(snap_path)
-        result = {}
-        ocr = threading.Thread(target=lambda: result.update(words=ocr_words(snap_path)),
-                               daemon=True)
-        ocr.start()                      # runs while the fade-in plays
-        run(args, snap, result, ocr, tint, tint_hot, font_path)
-    finally:
-        os.unlink(snap_path)
+    # OCR *before* the window opens, so its very first frame is already fully
+    # encrypted: no fade, no sweep. Until then the desktop simply stays as is.
+    boxes = ocr_boxes(snap)
+    run(args, snap, boxes, args.tint, font_path)
 
 
-def run(args, snap, result, ocr, tint, tint_hot, font_path):
+def run(args, snap, boxes, tint, font_path):
     offscreen = bool(args.output)
     if offscreen:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
-        ocr.join()
         if not args.seconds:
             args.seconds = 5
     else:
@@ -203,23 +231,35 @@ def run(args, snap, result, ocr, tint, tint_hot, font_path):
     W, H = screen.get_size()
     sx, sy = W / snap.width, H / snap.height
 
-    base_img = snap.resize((W, H), Image.LANCZOS)
-    filt_img = filtered(base_img, tint)
-    raw = to_surface(base_img)
+    # Only the coarse, quantised background ever reaches the screen.
+    filt_img = filtered(snap.resize((W, H), Image.LANCZOS), tint)
     filt = to_surface(filt_img)
     split = to_surface(rgb_split(filt_img, max(3, W // 300)))
+    del filt_img
 
     fonts, glyph_cache = {}, {}
 
-    def glyph(ch, size, hot):
-        key = (ch, size, hot)
+    def glyph(ch, size):
+        key = (ch, size)
         if key not in glyph_cache:
             if size not in fonts:
                 fonts[size] = pygame.font.Font(font_path, size)
-            glyph_cache[key] = fonts[size].render(ch, True, tint_hot if hot else tint)
+            glyph_cache[key] = fonts[size].render(ch, True, tint)
         return glyph_cache[key]
 
     words = []
+    cell = cell_size(H)
+    for (x, y, w, h) in boxes:
+        # widen each line to whole grid cells: line lengths are only
+        # known to within a cell (~4-5 characters)
+        x0 = int(x * sx) // cell * cell
+        x1 = -(-int((x + w) * sx) // cell) * cell
+        r = pygame.Rect(x0, int(y * sy) - 1, x1 - x0,
+                        int(h * sy) + 3).clip(screen.get_rect())
+        if r.w >= 3 and r.h >= 3:
+            words.append(Word(r, filt.get_at((max(0, r.x - 2), r.centery))[:3]))
+    del boxes
+
     t0 = time.monotonic()
     next_glitch = t0 + random.uniform(*GLITCH_EVERY)
     glitch_bands, glitch_until = [], 0.0
@@ -238,33 +278,9 @@ def run(args, snap, result, ocr, tint, tint_hot, font_path):
                     and abs(ev.rel[0]) + abs(ev.rel[1]) > 25:
                 return
 
-        # OCR finished → build words, encrypting top-to-bottom in a wave
-        if "words" in result:
-            for (x, y, w, h, text) in result.pop("words"):
-                r = pygame.Rect(int(x * sx) - 1, int(y * sy) - 1,
-                                int(w * sx) + 3, int(h * sy) + 3).clip(screen.get_rect())
-                if r.w < 3 or r.h < 3:
-                    continue
-                bg = filt.get_at((max(0, r.x - 2), r.centery))[:3]
-                start = now + WAVE_TIME * (r.y / H) + random.uniform(0, 0.4)
-                words.append(Word(r, text, start, bg))
-
-        # base: crossfade raw → filtered
-        a = min(1.0, (now - t0) / FADE_IN)
-        if a < 1.0:
-            screen.blit(raw, (0, 0))
-            filt.set_alpha(int(255 * a))
-            screen.blit(filt, (0, 0))
-            filt.set_alpha(None)
-        else:
-            screen.blit(filt, (0, 0))
+        screen.blit(filt, (0, 0))
 
         for wd in words:
-            if now < wd.start or wd.reveal_until > now:
-                continue                       # not yet / showing the real word
-            if random.random() < REVEAL_CHANCE * dt:
-                wd.reveal_until = now + REVEAL_TIME
-                continue
             for i in range(wd.n):
                 if random.random() < SCRAMBLE_RATE * dt / wd.n * 2:
                     wd.chars[i] = random.choice(GLYPHS)
@@ -272,9 +288,8 @@ def run(args, snap, result, ocr, tint, tint_hot, font_path):
             screen.fill(wd.bg, r)
             size = max(6, int(r.h * 0.85))
             cw = r.w / wd.n
-            fresh = now - wd.start < 0.35       # flash brighter as it encrypts
             for i, ch in enumerate(wd.chars):
-                g = glyph(ch, size, fresh)
+                g = glyph(ch, size)
                 gx = r.x + int(i * cw + (cw - g.get_width()) / 2)
                 gy = r.y + (r.h - g.get_height()) // 2
                 if cw < g.get_width():          # squeeze into narrow boxes
