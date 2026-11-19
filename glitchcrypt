@@ -334,11 +334,16 @@ def run(args, cfg, snap, boxes, font_path):
             args.seconds = 5
     else:
         os.environ.setdefault("SDL_VIDEODRIVER", "wayland,x11")
+    # SDL/pygame inhibit idle by default (like a video player). A screensaver
+    # must not: that would stop the real screen locker from ever kicking in.
+    os.environ.setdefault("SDL_VIDEO_ALLOW_SCREENSAVER", "1")
     import pygame as _pygame
     pygame = _pygame
 
     tint, glyphs = args.tint, cfg["glyphs"]
     pygame.init()
+    if os.environ["SDL_VIDEO_ALLOW_SCREENSAVER"] == "1":
+        pygame.display.set_allow_screensaver(True)   # never hold an idle inhibitor
     pygame.display.set_caption("GlitchCrypt")
     if offscreen:
         screen = pygame.display.set_mode(snap.size)
