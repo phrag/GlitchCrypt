@@ -92,6 +92,13 @@ class Window(Adw.ApplicationWindow):
         g.add(self.enable_row)
         g.add(self.spin("idle_minutes", "Start after", "Minutes of inactivity",
                         1, 120, 1, 0))
+        lock = Adw.SwitchRow(title="Lock when dismissed",
+                             subtitle="Coming back shows the lock screen, not your desktop")
+        lock.set_active(self.cfg["lock_on_dismiss"])
+        lock.connect("notify::active",
+                     lambda r, _: self.set("lock_on_dismiss", r.get_active()))
+        self.updaters.append(("lock_on_dismiss", lock.set_active))
+        g.add(lock)
 
         # --- Appearance -------------------------------------------------------
         g = Adw.PreferencesGroup(title="Appearance")
@@ -168,8 +175,9 @@ class Window(Adw.ApplicationWindow):
             title="Privacy",
             description="GlitchCrypt never writes your screen to disk, keeps none of "
                         "the text it recognises, and only shows a coarse, noisy "
-                        "version of the background. It is not a lock screen: any "
-                        "key, click or mouse move closes it.")
+                        "version of the background. It isn't a lock screen itself: "
+                        "with “Lock when dismissed” on, it hands over to your "
+                        "lock screen when you come back.")
         page.add(g)
 
         self.connect("close-request", lambda *_: self.flush() or False)

@@ -19,9 +19,13 @@ Only the rough layout of your screen shows through. See [Privacy](#privacy).
 
 *(The demo uses a made-up desktop drawn by [`docs/make-demo.py`](docs/make-demo.py).)*
 
-> **Not a lock screen.** Any key, click or mouse move closes it and shows
-> your desktop again. Keep using your normal screen locker. GlitchCrypt runs
-> before it.
+> **Hands over to your lock screen.** GlitchCrypt isn't a locker itself. With
+> *Lock when dismissed* on (the default), coming back with a key, click or
+> mouse move locks the session first, so you land on your lock screen and not
+> your desktop. GlitchCrypt keeps covering the screen until the session reports
+> it's locked. It uses `loginctl lock-session`, which DMS, GNOME, KDE and
+> others respond to. For a locker that doesn't listen to logind, set
+> `lock_command` in the config, e.g. `swaylock -f`.
 
 ## Requirements
 
@@ -71,6 +75,7 @@ Open **GlitchCrypt** from your app launcher to change:
 |---|---|---|
 | Start when idle | on | Turns the idle service on or off |
 | Start after | 3 min | Keep it shorter than your lock / screen-off timeout |
+| Lock when dismissed | on | Lock the session when you come back (not for previews) |
 | Colour | `#a9c7ff` | Tint and cipher characters |
 | Font | monospace | Drawn in bold |
 | Background detail | 45 | Grid rows. Capped at 60 so text can't be recovered |
@@ -81,8 +86,10 @@ Open **GlitchCrypt** from your app launcher to change:
 
 Changes save automatically to `~/.config/glitchcrypt/config.ini` and apply the
 next time GlitchCrypt starts. **Preview** runs it for 10 seconds. You can also
-edit the file by hand. Invalid or out-of-range values fall back to defaults or
-are clamped, and `glitchcrypt --print-config` shows what's in effect.
+edit the file by hand. That's also where `lock_command` lives (default
+`loginctl lock-session auto`). Invalid or out-of-range values fall back to
+defaults or are clamped, and `glitchcrypt --print-config` shows what's in
+effect.
 
 ## Command line
 

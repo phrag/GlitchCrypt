@@ -62,6 +62,10 @@ SETTINGS = {
     # text on common screens: above that the background could start to leak.
     "detail":          (45,      int,   15,  60),
     "glyphs":          ("0123456789ABCDEF#$%&@*+=<>/\\|{}[]?!~^:;", str, None, None),
+    # Dismissing GlitchCrypt (key, click, mouse move) locks the session first,
+    # so coming back shows the lock screen instead of the desktop.
+    "lock_on_dismiss": (True,    bool,  None, None),
+    "lock_command":    ("loginctl lock-session auto", str, None, None),
 }
 
 LEVELS = 4              # background grey levels (with dither) — not configurable
@@ -100,7 +104,7 @@ def load_config(path=CONFIG_PATH):
                 val = min(hi, max(lo, val))
             if key == "tint":
                 parse_hex(val)
-            if key in ("glyphs", "font") and not val.strip():
+            if key in ("glyphs", "font", "lock_command") and not val.strip():
                 raise ValueError("empty")
         except ValueError:
             print(f"glitchcrypt: bad {key} in {path}, using default", file=sys.stderr)
@@ -132,6 +136,40 @@ def resolve_font(spec):
         if out and os.path.exists(out):
             return out
     return None                                  # pygame's built-in font
+
+
+def session_locked():
+    """logind's LockedHint (DMS, GNOME, KDE and others set it when locked)."""
+    out = subprocess.run(["loginctl", "show-session", "auto", "-p", "LockedHint",
+                          "--value"], capture_output=True, text=True)
+    return out.stdout.strip() == "yes"
+
+
+_locked_once = False
+
+
+def lock_session(cfg, wait=3.0):
+    """Run the lock command, then wait (up to `wait` s) until the session
+    reports locked, so the caller can keep covering the screen meanwhile."""
+    global _locked_once
+    if _locked_once:
+        return
+    _locked_once = True
+    import shlex
+    try:
+        subprocess.run(shlex.split(cfg["lock_command"]), timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        print(f"glitchcrypt: lock command failed: {e}", file=sys.stderr)
+        return
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        if session_locked():
+            time.sleep(0.3)              # let the lock surface finish drawing
+            return
+        time.sleep(0.1)
+    print("glitchcrypt: session didn't report locked; check lock_command",
+          file=sys.stderr)
 
 
 def screen_capture_works():
@@ -315,8 +353,16 @@ def main():
     if args.idle:
         run_idle(cfg)                    # does not return
     harden_process("glitchcrypt")
-    # swayidle's resume does `pkill`: exit cleanly (and quietly)
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    # Lock on dismiss for real screensaver runs only, not timed previews/demos.
+    args.lock = cfg["lock_on_dismiss"] and not (args.seconds or args.output or args.image)
+
+    def on_term(*_):
+        # swayidle's resume does `pkill` when you come back: lock first (while
+        # this window still covers the screen), then exit cleanly.
+        if args.lock:
+            lock_session(cfg)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, on_term)
 
     snap = Image.open(args.image).convert("RGB") if args.image else snapshot()
     # OCR *before* the window opens, so its very first frame is already fully
@@ -395,12 +441,17 @@ def run(args, cfg, snap, boxes, font_path):
         now = time.monotonic()
         if args.seconds and now - t0 > args.seconds:
             break
+        dismissed = False
         for ev in pygame.event.get():
             if ev.type in (pygame.QUIT, pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN):
-                return
-            if ev.type == pygame.MOUSEMOTION and now > grace_until \
+                dismissed = True
+            elif ev.type == pygame.MOUSEMOTION and now > grace_until \
                     and abs(ev.rel[0]) + abs(ev.rel[1]) > 25:
-                return
+                dismissed = True
+        if dismissed:
+            if args.lock:
+                lock_session(cfg)        # window stays up until locked
+            return
 
         screen.blit(filt, (0, 0))
 
