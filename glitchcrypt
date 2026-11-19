@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""GlitchCrypt: a Wayland screensaver that "encrypts" the text on your screen.
+
+Takes a snapshot of the screen with grim, finds the words with tesseract OCR,
+then shows the snapshot darkened and tinted, with every word replaced by
+cycling cipher glyphs. Now and then a word briefly decrypts, and every few
+seconds a short RGB-split slice glitch runs.
+
+Exits on any key, mouse button or real mouse movement. When run from
+swayidle (see glitchcrypt.service) it is also killed on resume.
+
+This is eye candy, not a lock screen: the real text is still in memory and
+words decrypt on purpose. Pair it with your normal screen locker.
+
+https://www.gnu.org/licenses/gpl-3.0.html — GPL-3.0-or-later
+"""
+import argparse
+import io
+import os
+import random
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import warnings
+
+__version__ = "0.1.0"
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+# Distro pygame builds often lack AVX2; harmless at these frame rates.
+warnings.filterwarnings("ignore", message=".*avx2.*", category=RuntimeWarning)
+
+from PIL import Image, ImageChops, ImageDraw, ImageOps  # noqa: E402
+import pygame  # noqa: E402
+
+# ---- tuning -------------------------------------------------------------------
+GLYPHS = "0123456789ABCDEF#$%&@*+=<>/\\|{}[]?!~^:;"
+SCRAMBLE_RATE = 2.5     # glyph changes per word per second (on average)
+REVEAL_CHANCE = 0.012   # per word per second: briefly show the real word
+REVEAL_TIME = 1.6       # seconds a revealed word stays readable
+GLITCH_EVERY = (5.0, 10.0)
+GLITCH_TIME = 0.18
+FADE_IN = 1.5
+WAVE_TIME = 2.0         # top-to-bottom encryption sweep
+MIN_CONF = 35           # tesseract word confidence cut-off
+
+
+def hex_rgb(s):
+    s = s.lstrip("#")
+    if len(s) != 6:
+        raise argparse.ArgumentTypeError("colour must look like #a9c7ff")
+    return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def default_font():
+    """Bold monospace font file via fontconfig, or None for pygame's own."""
+    if shutil.which("fc-match"):
+        out = subprocess.run(["fc-match", "-f", "%{file}", "monospace:bold"],
+                             capture_output=True, text=True).stdout.strip()
+        if out and os.path.exists(out):
+            return out
+    return None
+
+
+def snapshot():
+    """Screen grab via grim (PPM: fast, and works with JPEG-less grim builds)."""
+    if not shutil.which("grim"):
+        sys.exit("glitchcrypt: grim not found (needs a wlroots/niri-style compositor)")
+    raw = subprocess.run(["grim", "-t", "ppm", "-"], check=True,
+                         capture_output=True).stdout
+    return Image.open(io.BytesIO(raw)).convert("RGB")
+
+
+def ocr_words(path):
+    """Word boxes from tesseract TSV, in snapshot pixel coordinates."""
+    if not shutil.which("tesseract"):
+        print("glitchcrypt: tesseract not found, nothing to encrypt", file=sys.stderr)
+        return []
+    out = subprocess.run(["tesseract", path, "-", "--psm", "11", "tsv"],
+                         capture_output=True, text=True).stdout
+    words = []
+    for line in out.splitlines()[1:]:
+        f = line.split("\t")
+        if len(f) < 12 or f[0] != "5":
+            continue
+        text = f[11].strip()
+        try:
+            x, y, w, h, conf = int(f[6]), int(f[7]), int(f[8]), int(f[9]), float(f[10])
+        except ValueError:
+            continue
+        if conf < MIN_CONF or not any(c.isalnum() for c in text) or not 6 <= h <= 160:
+            continue
+        words.append((x, y, w, h, text))
+    return words
+
+
+def filtered(img, tint):
+    """Darkened, tinted, scanlined copy of the snapshot."""
+    dark = tuple(max(2, int(c * 0.03)) for c in tint)
+    light = tuple(int(c * 0.38) for c in tint)
+    out = ImageOps.colorize(ImageOps.grayscale(img), dark, light).convert("RGB")
+    d = ImageDraw.Draw(out, "RGBA")
+    for y in range(0, out.height, 3):
+        d.line([(0, y), (out.width, y)], fill=(0, 0, 0, 70))
+    return out
+
+
+def rgb_split(img, dx):
+    r, g, b = img.split()
+    return Image.merge("RGB", (ImageChops.offset(r, dx, 0), g,
+                               ImageChops.offset(b, -dx, 0)))
+
+
+def to_surface(img):
+    return pygame.image.frombytes(img.tobytes(), img.size, "RGB").convert()
+
+
+class Word:
+    def __init__(self, rect, text, start, bg):
+        self.rect = rect
+        self.n = max(1, len(text))
+        self.chars = [random.choice(GLYPHS) for _ in range(self.n)]
+        self.start = start          # when it becomes encrypted
+        self.reveal_until = 0.0
+        self.bg = bg
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(
+        prog="glitchcrypt",
+        description="Screensaver that scrambles the text on your screen into cipher glyphs.")
+    ap.add_argument("--tint", type=hex_rgb, default=hex_rgb("#a9c7ff"),
+                    help="accent colour for the tint and glyphs (default #a9c7ff)")
+    ap.add_argument("--font", default=None,
+                    help="TTF/OTF file for the glyphs (default: fontconfig monospace:bold)")
+    ap.add_argument("--fps", type=int, default=12, help="frame rate (default 12)")
+    ap.add_argument("--image", help="use this image instead of a screen snapshot")
+    ap.add_argument("--seconds", type=float, default=0,
+                    help="quit after N seconds (default: run until input)")
+    ap.add_argument("--output", metavar="PNG",
+                    help="render offscreen and save the last frame (for demos); "
+                         "waits for OCR, then runs --seconds (default 5)")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    return ap.parse_args()
+
+
+def set_process_name(name):
+    """Run via `env python3`, the process is named python3; rename it so
+    `pkill -x glitchcrypt` (used by glitchcrypt.service) can find it."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(15, name.encode(), 0, 0, 0)          # PR_SET_NAME
+    except (OSError, AttributeError):
+        pass
+
+
+def main():
+    set_process_name("glitchcrypt")
+    args = parse_args()
+    # swayidle's resume does `pkill`: exit cleanly so the snapshot gets deleted
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    tint = args.tint
+    tint_hot = tuple(int(c + (255 - c) * 0.6) for c in tint)
+    font_path = args.font or default_font()
+
+    snap = Image.open(args.image).convert("RGB") if args.image else snapshot()
+    # tesseract wants a file; keep it in the user-only runtime dir and delete it.
+    fd, snap_path = tempfile.mkstemp(prefix="glitchcrypt-", suffix=".png",
+                                     dir=os.environ.get("XDG_RUNTIME_DIR"))
+    os.close(fd)
+    try:
+        snap.save(snap_path)
+        result = {}
+        ocr = threading.Thread(target=lambda: result.update(words=ocr_words(snap_path)),
+                               daemon=True)
+        ocr.start()                      # runs while the fade-in plays
+        run(args, snap, result, ocr, tint, tint_hot, font_path)
+    finally:
+        os.unlink(snap_path)
+
+
+def run(args, snap, result, ocr, tint, tint_hot, font_path):
+    offscreen = bool(args.output)
+    if offscreen:
+        os.environ["SDL_VIDEODRIVER"] = "dummy"
+        ocr.join()
+        if not args.seconds:
+            args.seconds = 5
+    else:
+        os.environ.setdefault("SDL_VIDEODRIVER", "wayland,x11")
+
+    pygame.init()
+    pygame.display.set_caption("GlitchCrypt")
+    if offscreen:
+        screen = pygame.display.set_mode(snap.size)
+    else:
+        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        pygame.mouse.set_visible(False)
+    W, H = screen.get_size()
+    sx, sy = W / snap.width, H / snap.height
+
+    base_img = snap.resize((W, H), Image.LANCZOS)
+    filt_img = filtered(base_img, tint)
+    raw = to_surface(base_img)
+    filt = to_surface(filt_img)
+    split = to_surface(rgb_split(filt_img, max(3, W // 300)))
+
+    fonts, glyph_cache = {}, {}
+
+    def glyph(ch, size, hot):
+        key = (ch, size, hot)
+        if key not in glyph_cache:
+            if size not in fonts:
+                fonts[size] = pygame.font.Font(font_path, size)
+            glyph_cache[key] = fonts[size].render(ch, True, tint_hot if hot else tint)
+        return glyph_cache[key]
+
+    words = []
+    t0 = time.monotonic()
+    next_glitch = t0 + random.uniform(*GLITCH_EVERY)
+    glitch_bands, glitch_until = [], 0.0
+    clock = pygame.time.Clock()
+    grace_until = t0 + 2.0
+    dt = 1.0 / args.fps
+
+    while True:
+        now = time.monotonic()
+        if args.seconds and now - t0 > args.seconds:
+            break
+        for ev in pygame.event.get():
+            if ev.type in (pygame.QUIT, pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN):
+                return
+            if ev.type == pygame.MOUSEMOTION and now > grace_until \
+                    and abs(ev.rel[0]) + abs(ev.rel[1]) > 25:
+                return
+
+        # OCR finished → build words, encrypting top-to-bottom in a wave
+        if "words" in result:
+            for (x, y, w, h, text) in result.pop("words"):
+                r = pygame.Rect(int(x * sx) - 1, int(y * sy) - 1,
+                                int(w * sx) + 3, int(h * sy) + 3).clip(screen.get_rect())
+                if r.w < 3 or r.h < 3:
+                    continue
+                bg = filt.get_at((max(0, r.x - 2), r.centery))[:3]
+                start = now + WAVE_TIME * (r.y / H) + random.uniform(0, 0.4)
+                words.append(Word(r, text, start, bg))
+
+        # base: crossfade raw → filtered
+        a = min(1.0, (now - t0) / FADE_IN)
+        if a < 1.0:
+            screen.blit(raw, (0, 0))
+            filt.set_alpha(int(255 * a))
+            screen.blit(filt, (0, 0))
+            filt.set_alpha(None)
+        else:
+            screen.blit(filt, (0, 0))
+
+        for wd in words:
+            if now < wd.start or wd.reveal_until > now:
+                continue                       # not yet / showing the real word
+            if random.random() < REVEAL_CHANCE * dt:
+                wd.reveal_until = now + REVEAL_TIME
+                continue
+            for i in range(wd.n):
+                if random.random() < SCRAMBLE_RATE * dt / wd.n * 2:
+                    wd.chars[i] = random.choice(GLYPHS)
+            r = wd.rect
+            screen.fill(wd.bg, r)
+            size = max(6, int(r.h * 0.85))
+            cw = r.w / wd.n
+            fresh = now - wd.start < 0.35       # flash brighter as it encrypts
+            for i, ch in enumerate(wd.chars):
+                g = glyph(ch, size, fresh)
+                gx = r.x + int(i * cw + (cw - g.get_width()) / 2)
+                gy = r.y + (r.h - g.get_height()) // 2
+                if cw < g.get_width():          # squeeze into narrow boxes
+                    g = pygame.transform.smoothscale(g, (max(1, int(cw)), g.get_height()))
+                    gx = r.x + int(i * cw)
+                screen.blit(g, (gx, gy))
+
+        # occasional short slice glitch
+        if now >= next_glitch:
+            glitch_until = now + GLITCH_TIME
+            next_glitch = now + random.uniform(*GLITCH_EVERY)
+            glitch_bands = []
+            for _ in range(random.randint(2, 4)):
+                bh = random.randint(H // 60, H // 14)
+                by = random.randint(0, H - bh)
+                dx = random.choice([-1, 1]) * random.randint(W // 80, W // 25)
+                glitch_bands.append((by, bh, dx))
+        if now < glitch_until:
+            for by, bh, dx in glitch_bands:
+                band = screen.subsurface((0, by, W, bh)).copy()
+                screen.blit(split, (0, by), (0, by, W, bh))
+                band.set_alpha(150)
+                screen.blit(band, (dx, by))
+
+        pygame.display.flip()
+        clock.tick(args.fps)
+
+    if offscreen:
+        pygame.image.save(screen, args.output)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        pygame.quit()

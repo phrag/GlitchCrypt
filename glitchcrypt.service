@@ -1,0 +1,16 @@
+[Unit]
+Description=GlitchCrypt screensaver (starts after 3 min idle)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+# Change 180 to taste. Keep it below your lock/screen-off timeout.
+ExecStart=/usr/bin/swayidle -w \
+    timeout 180 '%h/.local/bin/glitchcrypt' \
+    resume 'pkill -x glitchcrypt' \
+    before-sleep 'pkill -x glitchcrypt'
+ExecStopPost=-/usr/bin/pkill -x glitchcrypt
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
