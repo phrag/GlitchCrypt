@@ -98,9 +98,9 @@ GlitchCrypt is built to show as little of your screen as possible:
 - **The real screen is never shown, not even blurred.** Blurring isn't
   redaction: it can be partly reversed by deconvolution, and blurred text can
   be matched by blurring guesses the same way. GlitchCrypt instead averages
-  the screen down to a grid about 28 cells tall, each cell roughly two text
-  lines high. It then quantises every cell to one of 4 grey levels with
-  random dither. That throws the detail away for good: about 2 bits per cell
+  the screen down to a grid 45 cells tall, so each cell is taller than a
+  line of text and several characters wide. It then quantises every cell to
+  one of 4 grey levels with random dither. That throws the detail away for good: about 2 bits per cell
   survive, which is enough to show "something is here" but nowhere near
   enough to hold text. OCR finishes before the window opens, so the very
   first frame is already fully encrypted.

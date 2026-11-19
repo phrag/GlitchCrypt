@@ -38,7 +38,8 @@ import pygame  # noqa: E402
 # ---- tuning -------------------------------------------------------------------
 GLYPHS = "0123456789ABCDEF#$%&@*+=<>/\\|{}[]?!~^:;"
 SCRAMBLE_RATE = 2.5     # glyph changes per word per second (on average)
-GRID_ROWS = 28          # background is reduced to this many rows of cells...
+GRID_ROWS = 45          # background is reduced to this many rows of cells
+                        # (keep cells taller than a text line: ~<=60 for 1080p)...
 LEVELS = 4              # ...each quantised to this many grey levels, with noise
 GLITCH_EVERY = (5.0, 10.0)
 GLITCH_TIME = 0.18
@@ -113,7 +114,7 @@ def filtered(img, tint):
 
     A blur is NOT enough: blurring is largely reversible (deconvolution) and
     blurred text can be matched by rendering + blurring guesses. Instead the
-    screen is averaged down to a grid of cells ~2 text lines tall, and each
+    screen is averaged down to a grid of cells taller than a text line, and each
     cell is quantised to LEVELS grey levels with random dither. Quantisation
     discards information for good; what's left is ~2 bits per cell, enough to
     say "something bright/dark is here" and no more. That grid is then
