@@ -23,7 +23,9 @@ Only the rough layout of your screen shows through. See [Privacy](#privacy).
 > *Lock when dismissed* on (the default), coming back with a key, click or
 > mouse move locks the session first, so you land on your lock screen and not
 > your desktop. GlitchCrypt keeps covering the screen until the session reports
-> it's locked. It uses `loginctl lock-session`, which DMS, GNOME, KDE and
+> it's locked. If something else locks the session first, such as your shell's
+> own idle lock, GlitchCrypt steps aside right away, and it never starts behind
+> a lock screen, so you only ever unlock once. It uses `loginctl lock-session`, which DMS, GNOME, KDE and
 > others respond to. For a locker that doesn't listen to logind, set
 > `lock_command` in the config, e.g. `swaylock -f`.
 

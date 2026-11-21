@@ -174,7 +174,7 @@ def lock_session(cfg, wait=3.0):
     """Run the lock command, then wait (up to `wait` s) until the session
     reports locked, so the caller can keep covering the screen meanwhile."""
     global _locked_once
-    if _locked_once:
+    if _locked_once or session_locked():
         return
     _locked_once = True
     import shlex
@@ -477,6 +477,10 @@ def parent_main(args, cfg):
     """
     import selectors
     harden_process("glitchcrypt")
+    if session_locked():
+        # e.g. swayidle's timer ran out behind the lock screen. A cover started
+        # now would be waiting behind it after unlock and lock a second time.
+        return
     lock = cfg["lock_on_dismiss"] and not args.seconds
     stop = {"now": False}
     signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
@@ -504,10 +508,19 @@ def parent_main(args, cfg):
         sel.register(p.stdout, selectors.EVENT_READ)
 
     dismissed = False
+    next_lock_check = time.monotonic() + 1.0
     while not dismissed:
         if stop["now"]:
             dismissed = True
             break
+        if time.monotonic() >= next_lock_check:
+            next_lock_check = time.monotonic() + 1.0
+            if session_locked():
+                # Something else locked the session (e.g. the shell's own idle
+                # lock). The lock screen covers now; leave, or we'd still be
+                # here after unlock and lock again on the next touch.
+                lock = False
+                break
         for key, _ in sel.select(timeout=0.2):
             line = key.fileobj.readline()
             if line.strip() == "dismiss":
