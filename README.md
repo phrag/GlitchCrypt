@@ -80,9 +80,17 @@ Open **GlitchCrypt** from your app launcher to change:
 | Font | monospace | Drawn in bold |
 | Background detail | 45 | Grid rows. Capped at 60 so text can't be recovered |
 | Cipher characters | `0-9 A-F` + symbols | The alphabet the glyphs are drawn from |
-| Scramble speed | 2.5 | Character changes per second, per line |
-| Frame rate | 12 | |
-| Glitch effect | on, every ~7.5 s | |
+| Scramble speed | 3.5 plugged in / 1.5 on battery | Character changes per second, per line |
+| Frame rate | 20 plugged in / 6 on battery | Lower uses less power |
+| Glitch effect | every ~6 s plugged in / ~15 s on battery | |
+
+Motion has two profiles. **When plugged in** it's livelier, and **on
+battery** it's calmer to save power. GlitchCrypt checks the power source every
+few seconds and switches live. Either way, it only redraws the lines whose
+characters actually changed, not the whole screen every frame.
+
+Every monitor gets its own cover, from a snapshot of just that monitor, so an
+external display never shows your live desktop.
 
 Changes save automatically to `~/.config/glitchcrypt/config.ini` and apply the
 next time GlitchCrypt starts. **Preview** runs it for 10 seconds. You can also

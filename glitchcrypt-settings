@@ -152,23 +152,14 @@ class Window(Adw.ApplicationWindow):
         self.updaters.append(("glyphs", glyphs.set_text))
         g.add(glyphs)
 
-        # --- Motion -------------------------------------------------------------
-        g = Adw.PreferencesGroup(title="Motion")
-        page.add(g)
-        g.add(self.spin("scramble_rate", "Scramble speed",
-                        "Character changes per second, per line", 0, 10, 0.5, 1))
-        g.add(self.spin("fps", "Frame rate", "Frames per second", 4, 30, 1, 0))
-        glitch = Adw.SwitchRow(title="Glitch effect",
-                               subtitle="Short colour-split tears across the screen")
-        glitch.set_active(self.cfg["glitches"])
-        glitch.connect("notify::active", lambda r, _: self.set("glitches", r.get_active()))
-        self.updaters.append(("glitches", glitch.set_active))
-        g.add(glitch)
-        every = self.spin("glitch_interval", "Glitch every",
-                          "Average seconds between glitches", 2, 60, 0.5, 1)
-        glitch.bind_property("active", every, "sensitive",
-                             GObject.BindingFlags.SYNC_CREATE)
-        g.add(every)
+        # --- Motion, per power source -------------------------------------------
+        page.add(self.motion_group(
+            "", "When plugged in",
+            "Livelier. Applies while charging or on mains power."))
+        page.add(self.motion_group(
+            "battery_", "On battery",
+            "Calmer, to save power. GlitchCrypt switches live when you plug in "
+            "or unplug."))
 
         # --- Privacy note -------------------------------------------------------
         g = Adw.PreferencesGroup(
@@ -184,6 +175,26 @@ class Window(Adw.ApplicationWindow):
         self.loading = False
 
     # --- helpers ---------------------------------------------------------------
+    def motion_group(self, p, title, description):
+        g = Adw.PreferencesGroup(title=title, description=description)
+        g.add(self.spin(p + "scramble_rate", "Scramble speed",
+                        "Character changes per second, per line", 0, 10, 0.5, 1))
+        g.add(self.spin(p + "fps", "Frame rate",
+                        "Frames per second. Lower uses less power", 2, 30, 1, 0))
+        glitch = Adw.SwitchRow(title="Glitch effect",
+                               subtitle="Short colour-split tears across the screen")
+        glitch.set_active(self.cfg[p + "glitches"])
+        glitch.connect("notify::active",
+                       lambda r, _: self.set(p + "glitches", r.get_active()))
+        self.updaters.append((p + "glitches", glitch.set_active))
+        g.add(glitch)
+        every = self.spin(p + "glitch_interval", "Glitch every",
+                          "Average seconds between glitches", 2, 60, 0.5, 1)
+        glitch.bind_property("active", every, "sensitive",
+                             GObject.BindingFlags.SYNC_CREATE)
+        g.add(every)
+        return g
+
     def spin(self, key, title, subtitle, lo, hi, step, digits):
         adj = Gtk.Adjustment(lower=lo, upper=hi, step_increment=step,
                              page_increment=step * 5)

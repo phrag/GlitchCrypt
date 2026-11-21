@@ -7,6 +7,10 @@ of text replaced by cycling cipher glyphs. Every few seconds a short
 RGB-split slice glitch runs. Only the rough layout of the screen survives, and
 not even text that OCR missed can be recovered (see filtered()).
 
+Every monitor gets its own cover window (one process each, see parent_main()).
+Motion has a livelier plugged-in profile and a calmer battery profile that
+switch live, and only lines that change are redrawn, to save power.
+
 Settings live in ~/.config/glitchcrypt/config.ini (edit with
 glitchcrypt-settings); command-line options override them.
 
@@ -36,6 +40,9 @@ import warnings
 __version__ = "0.2.0"
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+# SDL turns SIGTERM/SIGINT into a QUIT event by default. We want real signals:
+# the parent's SIGTERM handler, and covers that die promptly when told to.
+os.environ["SDL_NO_SIGNAL_HANDLERS"] = "1"
 # Distro pygame builds often lack AVX2; harmless at these frame rates.
 warnings.filterwarnings("ignore", message=".*avx2.*", category=RuntimeWarning)
 
@@ -54,10 +61,16 @@ SETTINGS = {
     "idle_minutes":    (3,       int,   1,   120),
     "tint":            ("#a9c7ff", str, None, None),
     "font":            ("monospace", str, None, None),  # family or font file
-    "fps":             (12,      int,   4,   30),
-    "scramble_rate":   (2.5,     float, 0.0, 10.0),    # glyph changes/s per line
+    # Motion when plugged in (livelier)...
+    "fps":             (20,      int,   2,   30),
+    "scramble_rate":   (3.5,     float, 0.0, 10.0),    # glyph changes/s per line
     "glitches":        (True,    bool,  None, None),
-    "glitch_interval": (7.5,     float, 2.0, 60.0),    # average seconds between
+    "glitch_interval": (6.0,     float, 2.0, 60.0),    # average seconds between
+    # ...and on battery (calmer, far fewer redraws). Switches live.
+    "battery_fps":             (6,    int,   2,   30),
+    "battery_scramble_rate":   (1.5,  float, 0.0, 10.0),
+    "battery_glitches":        (True, bool,  None, None),
+    "battery_glitch_interval": (15.0, float, 2.0, 60.0),
     # Background grid rows. Capped at 60 so cells stay taller than a line of
     # text on common screens: above that the background could start to leak.
     "detail":          (45,      int,   15,  60),
@@ -172,6 +185,60 @@ def lock_session(cfg, wait=3.0):
           file=sys.stderr)
 
 
+def on_battery():
+    """True when running on battery (no mains/USB power online)."""
+    base = "/sys/class/power_supply"
+    has_battery = False
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return False
+    for name in names:
+        try:
+            with open(os.path.join(base, name, "type")) as f:
+                kind = f.read().strip()
+            if kind == "Battery":
+                has_battery = True
+                continue
+            with open(os.path.join(base, name, "online")) as f:
+                if kind in ("Mains", "USB", "USB_C", "USB_PD") and f.read().strip() == "1":
+                    return False
+        except OSError:
+            continue
+    return has_battery            # no battery at all (desktop) -> mains
+
+
+def motion(cfg, battery):
+    """The motion settings for the current power source."""
+    p = "battery_" if battery else ""
+    return {"fps": cfg[p + "fps"], "rate": cfg[p + "scramble_rate"],
+            "glitches": cfg[p + "glitches"], "every": cfg[p + "glitch_interval"]}
+
+
+def list_displays():
+    """[(sdl_index, output_name or None)] for every monitor, via SDL."""
+    import ctypes
+    os.environ.setdefault("SDL_VIDEODRIVER", "wayland,x11")
+    import pygame as pg
+    pg.display.init()
+    try:
+        n = pg.display.get_num_displays()
+        names = [None] * n
+        try:
+            sdl = ctypes.CDLL("libSDL2-2.0.so.0")
+            sdl.SDL_GetDisplayName.restype = ctypes.c_char_p
+            for i in range(n):
+                raw = sdl.SDL_GetDisplayName(i) or b""
+                # Wayland: "Vendor - Model - eDP-1": the connector name is last
+                last = raw.decode(errors="replace").rsplit(" - ", 1)[-1].strip()
+                names[i] = last or None
+        except OSError:
+            pass
+        return list(enumerate(names))
+    finally:
+        pg.display.quit()
+
+
 def screen_capture_works():
     """True if grim can capture here (wlroots/niri yes; GNOME/KDE no)."""
     if not shutil.which("grim"):
@@ -180,12 +247,18 @@ def screen_capture_works():
 
 
 # ---- capture + OCR --------------------------------------------------------------
-def snapshot():
-    """Screen grab via grim (PPM: fast, and works with JPEG-less grim builds)."""
+def snapshot(output=None):
+    """Screen grab via grim (PPM: fast, and works with JPEG-less grim builds).
+    With `output`, only that monitor; if grim doesn't know the name, all."""
     if not shutil.which("grim"):
         sys.exit("glitchcrypt: grim not found (needs a wlroots/niri-style compositor)")
-    raw = subprocess.run(["grim", "-t", "ppm", "-"], check=True,
-                         capture_output=True).stdout
+    cmd = ["grim", "-t", "ppm"] + (["-o", output] if output else []) + ["-"]
+    res = subprocess.run(cmd, capture_output=True)
+    if res.returncode != 0 and output:
+        res = subprocess.run(["grim", "-t", "ppm", "-"], capture_output=True)
+    if res.returncode != 0:
+        sys.exit("glitchcrypt: grim failed: " + res.stderr.decode(errors="replace").strip())
+    raw = res.stdout
     return Image.open(io.BytesIO(raw)).convert("RGB")
 
 
@@ -283,7 +356,8 @@ def parse_args(cfg):
                     f"glyphs. Settings: {CONFIG_PATH} (or glitchcrypt-settings).")
     ap.add_argument("--tint", default=cfg["tint"], help="colour, e.g. #a9c7ff")
     ap.add_argument("--font", default=cfg["font"], help="font family or file")
-    ap.add_argument("--fps", type=int, default=cfg["fps"], help="frame rate")
+    ap.add_argument("--fps", type=int, default=None,
+                    help="frame rate (default: from settings, by power source)")
     ap.add_argument("--image", help="use this image instead of a screen snapshot")
     ap.add_argument("--seconds", type=float, default=0,
                     help="quit after N seconds (default: run until input)")
@@ -295,12 +369,17 @@ def parse_args(cfg):
     ap.add_argument("--print-config", action="store_true",
                     help="print the effective settings as JSON and exit")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    # internal: one cover process per monitor
+    ap.add_argument("--child-display", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--child-output", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
+    args.tint_hex = args.tint
     try:
         args.tint = parse_hex(args.tint)
     except ValueError as e:
         ap.error(str(e))
-    args.fps = min(30, max(4, args.fps))
+    if args.fps is not None:
+        args.fps = min(30, max(2, args.fps))
     return args
 
 
@@ -327,6 +406,17 @@ def harden_process(name):
         pass
 
 
+def die_with_parent():
+    """PR_SET_PDEATHSIG: a cover process never outlives its parent."""
+    try:
+        import ctypes
+        ctypes.CDLL(None).prctl(1, signal.SIGTERM, 0, 0, 0)
+    except (OSError, AttributeError):
+        pass
+    if os.getppid() == 1:            # parent already gone
+        sys.exit(0)
+
+
 def run_idle(cfg):
     """exec swayidle: start GlitchCrypt after the configured idle time."""
     if not screen_capture_works():
@@ -344,6 +434,7 @@ def run_idle(cfg):
                            "resume", stop, "before-sleep", stop])
 
 
+# ---- processes --------------------------------------------------------------------
 def main():
     cfg = load_config()
     args = parse_args(cfg)
@@ -352,26 +443,91 @@ def main():
         return
     if args.idle:
         run_idle(cfg)                    # does not return
+    if args.child_display is not None:
+        child_main(args, cfg)
+    elif args.image or args.output:
+        harden_process("glitchcrypt")    # demo / test: one window, no lock
+        snap = Image.open(args.image).convert("RGB") if args.image else snapshot()
+        run(args, cfg, snap, ocr_boxes(snap), resolve_font(args.font))
+    else:
+        parent_main(args, cfg)
+
+
+def parent_main(args, cfg):
+    """Start one cover process per monitor; on dismiss, lock, then end them.
+
+    Only this process is named "glitchcrypt", so swayidle's `pkill -x
+    glitchcrypt` reaches it alone: the covers stay up until the lock is.
+    """
+    import selectors
     harden_process("glitchcrypt")
-    # Lock on dismiss for real screensaver runs only, not timed previews/demos.
-    args.lock = cfg["lock_on_dismiss"] and not (args.seconds or args.output or args.image)
+    lock = cfg["lock_on_dismiss"] and not args.seconds
+    stop = {"now": False}
+    signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
 
-    def on_term(*_):
-        # swayidle's resume does `pkill` when you come back: lock first (while
-        # this window still covers the screen), then exit cleanly.
-        if args.lock:
-            lock_session(cfg)
-        sys.exit(0)
-    signal.signal(signal.SIGTERM, on_term)
+    try:
+        displays = list_displays()
+    except Exception as e:                       # noqa: BLE001 — never fail open
+        print(f"glitchcrypt: couldn't list monitors ({e}); using one", file=sys.stderr)
+        displays = [(0, None)]
+    me = os.path.abspath(__file__)
+    common = ["--tint", args.tint_hex, "--font", args.font]
+    if args.fps:
+        common += ["--fps", str(args.fps)]
+    if args.seconds:
+        common += ["--seconds", str(args.seconds)]
 
-    snap = Image.open(args.image).convert("RGB") if args.image else snapshot()
+    children = []
+    sel = selectors.DefaultSelector()
+    for index, name in displays or [(0, None)]:
+        cmd = [sys.executable, me, "--child-display", str(index)] + common
+        if name:
+            cmd += ["--child-output", name]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+        children.append(p)
+        sel.register(p.stdout, selectors.EVENT_READ)
+
+    dismissed = False
+    while not dismissed:
+        if stop["now"]:
+            dismissed = True
+            break
+        for key, _ in sel.select(timeout=0.2):
+            line = key.fileobj.readline()
+            if line.strip() == "dismiss":
+                dismissed = True
+            elif not line:
+                sel.unregister(key.fileobj)
+        codes = [p.poll() for p in children]
+        if all(c == 0 for c in codes):            # timed preview finished
+            break
+        if any(c not in (None, 0) for c in codes):
+            dismissed = True                      # a cover crashed: fail closed
+
+    if dismissed and lock:
+        lock_session(cfg)                         # covers still up meanwhile
+    for p in children:
+        if p.poll() is None:
+            p.terminate()
+    for p in children:
+        try:
+            p.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+def child_main(args, cfg):
+    harden_process("glitchcrypt-out")
+    die_with_parent()
+    snap = snapshot(args.child_output)
     # OCR *before* the window opens, so its very first frame is already fully
-    # encrypted: no fade, no sweep. Until then the desktop simply stays as is.
+    # encrypted. Until then the desktop simply stays as it is.
     boxes = ocr_boxes(snap)
-    run(args, cfg, snap, boxes, resolve_font(args.font))
+    run(args, cfg, snap, boxes, resolve_font(args.font), display=args.child_display)
 
 
-def run(args, cfg, snap, boxes, font_path):
+# ---- drawing ------------------------------------------------------------------------
+def run(args, cfg, snap, boxes, font_path, display=None):
     global pygame
     offscreen = bool(args.output)
     if offscreen:
@@ -394,13 +550,15 @@ def run(args, cfg, snap, boxes, font_path):
     if offscreen:
         screen = pygame.display.set_mode(snap.size)
     else:
-        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN,
+                                         display=display or 0)
         pygame.mouse.set_visible(False)
     W, H = screen.get_size()
     sx, sy = W / snap.width, H / snap.height
 
     # Only the coarse, quantised background ever reaches the screen.
     filt_img = filtered(snap.resize((W, H), Image.LANCZOS), tint, cfg["detail"])
+    del snap
     filt = to_surface(filt_img)
     split = to_surface(rgb_split(filt_img, max(3, W // 300)))
     del filt_img
@@ -415,6 +573,20 @@ def run(args, cfg, snap, boxes, font_path):
             glyph_cache[key] = fonts[size].render(ch, True, tint)
         return glyph_cache[key]
 
+    def draw_line(ln):
+        r = ln.rect
+        screen.fill(ln.bg, r)
+        size = max(6, int(r.h * 0.85))
+        cw = r.w / ln.n
+        for i, ch in enumerate(ln.chars):
+            g = glyph(ch, size)
+            gx = r.x + int(i * cw + (cw - g.get_width()) / 2)
+            gy = r.y + (r.h - g.get_height()) // 2
+            if cw < g.get_width():          # squeeze into narrow boxes
+                g = pygame.transform.smoothscale(g, (max(1, int(cw)), g.get_height()))
+                gx = r.x + int(i * cw)
+            screen.blit(g, (gx, gy))
+
     lines = []
     cell = cell_size(H, cfg["detail"])
     for (x, y, w, h) in boxes:
@@ -428,14 +600,18 @@ def run(args, cfg, snap, boxes, font_path):
             lines.append(Line(r, filt.get_at((max(0, r.x - 2), r.centery))[:3], glyphs))
     del boxes
 
-    every = cfg["glitch_interval"]
+    # Motion depends on the power source and is re-checked every few seconds.
+    battery = on_battery()
+    m = motion(cfg, battery)
+    next_power_check = time.monotonic() + 5
+
     t0 = time.monotonic()
-    next_glitch = t0 + random.uniform(every * 0.6, every * 1.4)
+    next_glitch = t0 + random.uniform(m["every"] * 0.6, m["every"] * 1.4)
     glitch_bands, glitch_until = [], 0.0
     clock = pygame.time.Clock()
     grace_until = t0 + 2.0
-    dt = 1.0 / args.fps
-    rate = cfg["scramble_rate"]
+    reported = False
+    full = True                      # redraw everything on the next frame
 
     while True:
         now = time.monotonic()
@@ -448,49 +624,66 @@ def run(args, cfg, snap, boxes, font_path):
             elif ev.type == pygame.MOUSEMOTION and now > grace_until \
                     and abs(ev.rel[0]) + abs(ev.rel[1]) > 25:
                 dismissed = True
+            elif ev.type in (pygame.WINDOWEXPOSED, pygame.VIDEOEXPOSE,
+                             pygame.WINDOWSIZECHANGED):
+                full = True
         if dismissed:
-            if args.lock:
-                lock_session(cfg)        # window stays up until locked
-            return
+            if display is None:
+                return                   # demo/test window: just close
+            if not reported:
+                # tell the parent; keep covering until it has locked the session
+                print("dismiss", flush=True)
+                reported = True
 
-        screen.blit(filt, (0, 0))
+        if now >= next_power_check:
+            next_power_check = now + 5
+            b = on_battery()
+            if b != battery:
+                battery, m, full = b, motion(cfg, b), True
+        fps = args.fps or m["fps"]
+        dt = 1.0 / fps
 
+        # scramble: only lines that actually changed get redrawn
+        changed = []
         for ln in lines:
+            hit = False
             for i in range(ln.n):
-                if random.random() < rate * dt / ln.n * 2:
+                if random.random() < m["rate"] * dt / ln.n * 2:
                     ln.chars[i] = random.choice(glyphs)
-            r = ln.rect
-            screen.fill(ln.bg, r)
-            size = max(6, int(r.h * 0.85))
-            cw = r.w / ln.n
-            for i, ch in enumerate(ln.chars):
-                g = glyph(ch, size)
-                gx = r.x + int(i * cw + (cw - g.get_width()) / 2)
-                gy = r.y + (r.h - g.get_height()) // 2
-                if cw < g.get_width():          # squeeze into narrow boxes
-                    g = pygame.transform.smoothscale(g, (max(1, int(cw)), g.get_height()))
-                    gx = r.x + int(i * cw)
-                screen.blit(g, (gx, gy))
+                    hit = True
+            if hit:
+                changed.append(ln)
 
         # occasional short slice glitch
-        if cfg["glitches"] and now >= next_glitch:
+        if m["glitches"] and now >= next_glitch:
             glitch_until = now + GLITCH_TIME
-            next_glitch = now + random.uniform(every * 0.6, every * 1.4)
+            next_glitch = now + random.uniform(m["every"] * 0.6, m["every"] * 1.4)
             glitch_bands = []
             for _ in range(random.randint(2, 4)):
                 bh = random.randint(H // 60, H // 14)
                 by = random.randint(0, H - bh)
                 dx = random.choice([-1, 1]) * random.randint(W // 80, W // 25)
                 glitch_bands.append((by, bh, dx))
-        if now < glitch_until:
-            for by, bh, dx in glitch_bands:
+        glitching = now < glitch_until
+        if glitch_bands and not glitching:
+            glitch_bands, full = [], True        # wipe the last glitch away
+
+        if full or glitching or offscreen:
+            screen.blit(filt, (0, 0))
+            for ln in lines:
+                draw_line(ln)
+            for by, bh, dx in (glitch_bands if glitching else []):
                 band = screen.subsurface((0, by, W, bh)).copy()
                 screen.blit(split, (0, by), (0, by, W, bh))
                 band.set_alpha(150)
                 screen.blit(band, (dx, by))
-
-        pygame.display.flip()
-        clock.tick(args.fps)
+            pygame.display.flip()
+            full = False
+        elif changed:
+            for ln in changed:
+                draw_line(ln)
+            pygame.display.update([ln.rect for ln in changed])
+        clock.tick(fps)
 
     if offscreen:
         pygame.image.save(screen, args.output)
