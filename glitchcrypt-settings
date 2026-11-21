@@ -117,7 +117,19 @@ class Window(Adw.ApplicationWindow):
         self.updaters.append(("tint", set_color))
         row.add_suffix(color)
         row.set_activatable_widget(color)
-        g.add(row)
+        color_row = row
+
+        rnd = Adw.SwitchRow(title="Random colour",
+                            subtitle="Pick a new bright colour every time it starts")
+        rnd.set_active(self.cfg["random_tint"])
+        rnd.connect("notify::active", lambda r, _: self.set("random_tint", r.get_active()))
+        self.updaters.append(("random_tint", rnd.set_active))
+        # the fixed colour only matters while random is off
+        rnd.bind_property("active", color_row, "sensitive",
+                          GObject.BindingFlags.SYNC_CREATE
+                          | GObject.BindingFlags.INVERT_BOOLEAN)
+        g.add(rnd)
+        g.add(color_row)
 
         row = Adw.ActionRow(title="Font", subtitle="Cipher characters are drawn in bold")
         font = Gtk.FontDialogButton(dialog=Gtk.FontDialog(), level=Gtk.FontLevel.FAMILY,

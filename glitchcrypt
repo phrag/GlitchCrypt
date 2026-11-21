@@ -60,6 +60,7 @@ SECTION = "glitchcrypt"
 SETTINGS = {
     "idle_minutes":    (3,       int,   1,   120),
     "tint":            ("#a9c7ff", str, None, None),
+    "random_tint":     (False,   bool,  None, None),   # new colour every run
     "font":            ("monospace", str, None, None),  # family or font file
     # Motion when plugged in (livelier)...
     "fps":             (20,      int,   2,   30),
@@ -84,6 +85,14 @@ SETTINGS = {
 LEVELS = 4              # background grey levels (with dither) — not configurable
 GLITCH_TIME = 0.18
 MIN_CONF = 35           # tesseract word confidence cut-off
+
+
+def random_tint_hex():
+    """A random hue, kept light and saturated so glyphs stay readable on the
+    dark background."""
+    import colorsys
+    r, g, b = colorsys.hls_to_rgb(random.random(), 0.76, 0.85)
+    return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
 
 
 def parse_hex(s):
@@ -354,7 +363,8 @@ def parse_args(cfg):
         prog="glitchcrypt",
         description="Screensaver that scrambles the text on your screen into cipher "
                     f"glyphs. Settings: {CONFIG_PATH} (or glitchcrypt-settings).")
-    ap.add_argument("--tint", default=cfg["tint"], help="colour, e.g. #a9c7ff")
+    ap.add_argument("--tint", default=None,
+                    help="colour, e.g. #a9c7ff, or 'random' (default: from settings)")
     ap.add_argument("--font", default=cfg["font"], help="font family or file")
     ap.add_argument("--fps", type=int, default=None,
                     help="frame rate (default: from settings, by power source)")
@@ -373,6 +383,12 @@ def parse_args(cfg):
     ap.add_argument("--child-display", type=int, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--child-output", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
+    # Resolve the colour once here. The parent passes the result to every
+    # monitor's cover, so a random colour is the same on all screens.
+    if args.tint is None:
+        args.tint = "random" if cfg["random_tint"] else cfg["tint"]
+    if args.tint.strip().lower() == "random":
+        args.tint = random_tint_hex()
     args.tint_hex = args.tint
     try:
         args.tint = parse_hex(args.tint)

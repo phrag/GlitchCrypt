@@ -76,7 +76,8 @@ Open **GlitchCrypt** from your app launcher to change:
 | Start when idle | on | Turns the idle service on or off |
 | Start after | 3 min | Keep it shorter than your lock / screen-off timeout |
 | Lock when dismissed | on | Lock the session when you come back (not for previews) |
-| Colour | `#a9c7ff` | Tint and cipher characters |
+| Random colour | off | A new bright colour every time it starts, the same on all monitors |
+| Colour | `#a9c7ff` | Tint and cipher characters, when random is off |
 | Font | monospace | Drawn in bold |
 | Background detail | 45 | Grid rows. Capped at 60 so text can't be recovered |
 | Cipher characters | `0-9 A-F` + symbols | The alphabet the glyphs are drawn from |
@@ -105,6 +106,7 @@ effect.
 glitchcrypt                    # run now, until a key, click or mouse move
 glitchcrypt --seconds 15       # preview for 15 s
 glitchcrypt --tint '#ff6ac1'   # override the colour for this run
+glitchcrypt --tint random      # a random colour for this run
 glitchcrypt --image shot.png --output out.png   # render offscreen to a PNG
 ```
 
