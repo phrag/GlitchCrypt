@@ -80,6 +80,8 @@ SETTINGS = {
     # so coming back shows the lock screen instead of the desktop.
     "lock_on_dismiss": (True,    bool,  None, None),
     "lock_command":    ("loginctl lock-session auto", str, None, None),
+    # Lock after this many minutes of screensaver even if untouched (0 = never).
+    "lock_after_minutes": (5,    int,   0,   120),
 }
 
 LEVELS = 4              # background grey levels (with dither) — not configurable
@@ -167,31 +169,40 @@ def session_locked():
     return out.stdout.strip() == "yes"
 
 
-_locked_once = False
-
-
 def lock_session(cfg, wait=3.0):
     """Run the lock command, then wait (up to `wait` s) until the session
-    reports locked, so the caller can keep covering the screen meanwhile."""
-    global _locked_once
-    if _locked_once or session_locked():
-        return
-    _locked_once = True
+    reports locked, so the caller can keep covering the screen meanwhile.
+    Returns True once the session is locked."""
+    if session_locked():
+        return True
     import shlex
     try:
         subprocess.run(shlex.split(cfg["lock_command"]), timeout=5,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except (OSError, ValueError, subprocess.TimeoutExpired) as e:
         print(f"glitchcrypt: lock command failed: {e}", file=sys.stderr)
-        return
+        return False
     end = time.monotonic() + wait
     while time.monotonic() < end:
         if session_locked():
             time.sleep(0.3)              # let the lock surface finish drawing
-            return
+            return True
         time.sleep(0.1)
-    print("glitchcrypt: session didn't report locked; check lock_command",
-          file=sys.stderr)
+    return False
+
+
+def lock_until_locked(cfg):
+    """Keep trying to lock, every few seconds, for as long as it takes. The
+    covers stay up meanwhile: a failed lock must not uncover the desktop.
+    Way out if the lock command is broken: `pkill -KILL -x glitchcrypt`
+    from another TTY (the covers die with the parent)."""
+    warned = False
+    while not lock_session(cfg):
+        if not warned:
+            print("glitchcrypt: session didn't lock; keeping the screen covered "
+                  "and retrying. Check lock_command", file=sys.stderr)
+            warned = True
+        time.sleep(2)
 
 
 def on_battery():
@@ -482,6 +493,9 @@ def parent_main(args, cfg):
         # now would be waiting behind it after unlock and lock a second time.
         return
     lock = cfg["lock_on_dismiss"] and not args.seconds
+    # Lock anyway after this long, even if nobody touches anything.
+    lock_at = (time.monotonic() + cfg["lock_after_minutes"] * 60
+               if cfg["lock_after_minutes"] and not args.seconds else None)
     stop = {"now": False}
     signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
 
@@ -521,6 +535,9 @@ def parent_main(args, cfg):
                 # here after unlock and lock again on the next touch.
                 lock = False
                 break
+            if lock_at and time.monotonic() >= lock_at:
+                dismissed = lock = True
+                break
         for key, _ in sel.select(timeout=0.2):
             line = key.fileobj.readline()
             if line.strip() == "dismiss":
@@ -534,7 +551,7 @@ def parent_main(args, cfg):
             dismissed = True                      # a cover crashed: fail closed
 
     if dismissed and lock:
-        lock_session(cfg)                         # covers still up meanwhile
+        lock_until_locked(cfg)                    # covers still up meanwhile
     for p in children:
         if p.poll() is None:
             p.terminate()
@@ -633,6 +650,10 @@ def run(args, cfg, snap, boxes, font_path, display=None):
     battery = on_battery()
     m = motion(cfg, battery)
     next_power_check = time.monotonic() + 5
+    # A monitor plugged in while we cover would show the live desktop: there
+    # is no cover on it. Treat that like a touch, so the session gets locked.
+    monitors = pygame.display.get_num_displays() if display is not None else 0
+    next_monitor_check = time.monotonic() + 1
 
     t0 = time.monotonic()
     next_glitch = t0 + random.uniform(m["every"] * 0.6, m["every"] * 1.4)
@@ -656,6 +677,10 @@ def run(args, cfg, snap, boxes, font_path, display=None):
             elif ev.type in (pygame.WINDOWEXPOSED, pygame.VIDEOEXPOSE,
                              pygame.WINDOWSIZECHANGED):
                 full = True
+        if display is not None and now >= next_monitor_check:
+            next_monitor_check = now + 1
+            if pygame.display.get_num_displays() > monitors:
+                dismissed = True
         if dismissed:
             if display is None:
                 return                   # demo/test window: just close

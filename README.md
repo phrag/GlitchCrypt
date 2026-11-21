@@ -78,6 +78,7 @@ Open **GlitchCrypt** from your app launcher to change:
 | Start when idle | on | Turns the idle service on or off |
 | Start after | 3 min | Keep it shorter than your lock / screen-off timeout |
 | Lock when dismissed | on | Lock the session when you come back (not for previews) |
+| Lock after | 5 min | Lock anyway after this long on screen, even if untouched (0 = never) |
 | Random colour | off | A new bright colour every time it starts, the same on all monitors |
 | Colour | `#a9c7ff` | Tint and cipher characters, when random is off |
 | Font | monospace | Drawn in bold |
@@ -140,6 +141,11 @@ GlitchCrypt is built to show as little of your screen as possible:
   survive, which is enough to show "something is here" but nowhere near
   enough to hold text. OCR finishes before the window opens, so the very
   first frame is already fully encrypted.
+- **It fails closed.** If the lock command doesn't lock the session, the
+  covers stay up and it keeps retrying instead of uncovering your desktop.
+  (If `lock_command` is broken, get out with `pkill -KILL -x glitchcrypt` from
+  another TTY.) Plugging in a monitor, which would show your live desktop
+  uncovered, counts as a touch and locks the session.
 - **Its memory stays private.** It disables core dumps and marks itself
   non-dumpable, so other unprivileged processes can't attach to it or read
   its memory.

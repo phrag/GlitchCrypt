@@ -99,6 +99,9 @@ class Window(Adw.ApplicationWindow):
                      lambda r, _: self.set("lock_on_dismiss", r.get_active()))
         self.updaters.append(("lock_on_dismiss", lock.set_active))
         g.add(lock)
+        g.add(self.spin("lock_after_minutes", "Lock after",
+                        "Minutes of screensaver before locking anyway (0 = never)",
+                        0, 120, 1, 0))
 
         # --- Appearance -------------------------------------------------------
         g = Adw.PreferencesGroup(title="Appearance")
@@ -180,7 +183,8 @@ class Window(Adw.ApplicationWindow):
                         "the text it recognises, and only shows a coarse, noisy "
                         "version of the background. It isn't a lock screen itself: "
                         "with “Lock when dismissed” on, it hands over to your "
-                        "lock screen when you come back.")
+                        "lock screen when you come back, and it also locks when "
+                        "a monitor is plugged in or “Lock after” runs out.")
         page.add(g)
 
         self.connect("close-request", lambda *_: self.flush() or False)
