@@ -48,7 +48,7 @@ sudo dnf install python3-pygame python3-pillow tesseract grim swayidle
 ## Install
 
 ```sh
-git clone <this repo> && cd GlitchCrypt
+git clone https://github.com/phrag/GlitchCrypt.git && cd GlitchCrypt
 ./install.sh --enable
 ```
 
